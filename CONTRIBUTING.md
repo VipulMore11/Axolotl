@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-CI Guardian AI is an autonomous software engineering agent that monitors GitLab CI/CD pipelines. When a pipeline fails, the agent automatically:
+Axolotl is an autonomous software engineering agent that monitors GitLab CI/CD pipelines. When a pipeline fails, the agent automatically:
 
 1. Detects the failure
 2. Fetches pipeline logs
