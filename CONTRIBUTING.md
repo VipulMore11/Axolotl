@@ -1,6 +1,6 @@
 # TEAM_DISTRIBUTION.md
 
-# CI Guardian AI - Team Responsibilities
+# Axolotl - Team Responsibilities
 
 ## Project Overview
 
