@@ -1,12 +1,13 @@
 from abc import ABC, abstractmethod
 
 from schemas.fix import FixProposal
+from schemas.pipeline import PipelineFailure
 
 
 class BaseAgent(ABC):
-    """Base interface for all CI-fix agents."""
+    """Abstract contract for all CI-fix agents."""
 
     @abstractmethod
-    async def analyze(self, logs: str) -> FixProposal:
-        """Inspect pipeline logs and return a structured fix proposal."""
+    async def analyze(self, failure: PipelineFailure) -> FixProposal:
+        """Inspect a pipeline failure and return a structured fix proposal."""
         raise NotImplementedError
