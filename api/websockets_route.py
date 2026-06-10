@@ -2,24 +2,24 @@ from fastapi import APIRouter
 from fastapi import WebSocket
 from fastapi import WebSocketDisconnect
 
-from websocket.connection_manager import (
-    ConnectionManager
+from core.dependencies import (
+    connection_manager
 )
 
 router = APIRouter()
 
-manager = ConnectionManager()
 
-
-@router.websocket(
-    "/ws/{session_id}"
-)
+@router.websocket("/ws/{session_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
     session_id: str
 ):
 
-    await manager.connect(
+    print(
+        f"[WS CONNECTED] {session_id}"
+    )
+
+    await connection_manager.connect(
         session_id,
         websocket
     )
@@ -31,7 +31,11 @@ async def websocket_endpoint(
 
     except WebSocketDisconnect:
 
-        manager.disconnect(
+        print(
+            f"[WS DISCONNECTED] {session_id}"
+        )
+
+        connection_manager.disconnect(
             session_id,
             websocket
         )
