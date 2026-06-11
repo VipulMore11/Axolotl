@@ -1,15 +1,82 @@
+"use client"
+
 import { Badge } from "@/components/ui/badge"
-import { pipeline } from "@/lib/axolotl-data"
-import { CircleDot, Clock, GitCommit, Bot, ShieldCheck } from "lucide-react"
+import { CircleDot, Clock, GitCommit, Bot, ShieldCheck, Wifi, WifiOff } from "lucide-react"
 
-const stats = [
-  { label: "Failed Job", value: "test:integration", icon: CircleDot, tone: "text-destructive" },
-  { label: "Detected → MR", value: "21.4s", icon: Clock, tone: "text-accent" },
-  { label: "Model", value: "gemini-2.5-pro", icon: Bot, tone: "text-foreground" },
-  { label: "Confidence", value: "94%", icon: ShieldCheck, tone: "text-chart-3" },
-]
+interface PipelineHeaderProps {
+  sessionId: string | null
+  events: Array<{ event_type: string; message: string }>
+  isConnected: boolean
+}
 
-export function PipelineHeader() {
+export function PipelineHeader({ sessionId, events, isConnected }: PipelineHeaderProps) {
+  if (!sessionId) {
+    return (
+      <section className="border-b border-border bg-card/40">
+        <div className="px-4 py-5 md:px-6">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2.5">
+              <h1 className="font-mono text-lg font-semibold text-foreground">
+                Dashboard
+              </h1>
+              <Badge variant="outline" className="font-mono text-xs text-muted-foreground">
+                idle
+              </Badge>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              {isConnected ? (
+                <>
+                  <span className="size-1.5 animate-pulse rounded-full bg-chart-3" />
+                  <span className="text-chart-3">WebSocket live</span>
+                </>
+              ) : (
+                <>
+                  <span className="size-1.5 rounded-full bg-chart-4" />
+                  <span className="text-chart-4">Connecting...</span>
+                </>
+              )}
+            </div>
+          </div>
+          <p className="mt-2 text-sm text-muted-foreground">
+            No active pipeline fix session. The agent is monitoring your pipelines.
+          </p>
+        </div>
+      </section>
+    )
+  }
+
+  // Extract info from events
+  const pipelineEvent = events.find((e) => e.event_type === "pipeline_failed")
+  const analyzeEvent = events.find((e) => e.event_type === "generating_fix")
+  const isComplete = events.some((e) => e.event_type === "waiting_approval" || e.event_type === "fix_succeeded")
+
+  const stats = [
+    {
+      label: "Session",
+      value: sessionId.replace("pipeline-", "#"),
+      icon: CircleDot,
+      tone: "text-primary",
+    },
+    {
+      label: "Status",
+      value: isComplete ? "Awaiting Approval" : "In Progress",
+      icon: Clock,
+      tone: isComplete ? "text-chart-4" : "text-accent",
+    },
+    {
+      label: "Model",
+      value: "gemini-2.5-pro",
+      icon: Bot,
+      tone: "text-foreground",
+    },
+    {
+      label: "Connection",
+      value: isConnected ? "Live" : "Offline",
+      icon: isConnected ? Wifi : WifiOff,
+      tone: isConnected ? "text-chart-3" : "text-destructive",
+    },
+  ]
+
   return (
     <section className="border-b border-border bg-card/40">
       <div className="px-4 py-5 md:px-6">
@@ -17,25 +84,26 @@ export function PipelineHeader() {
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2.5">
               <h1 className="font-mono text-lg font-semibold text-foreground">
-                Pipeline {pipeline.id}
+                Pipeline {sessionId.replace("pipeline-", "#")}
               </h1>
-              <Badge className="gap-1.5 border-primary/30 bg-primary/15 text-primary hover:bg-primary/15">
-                <span className="size-1.5 animate-pulse rounded-full bg-primary" />
-                Awaiting Approval
-              </Badge>
-              <Badge variant="outline" className="font-mono text-xs text-muted-foreground">
-                trigger: {pipeline.trigger}
-              </Badge>
+              {isComplete ? (
+                <Badge className="gap-1.5 border-primary/30 bg-primary/15 text-primary hover:bg-primary/15">
+                  <span className="size-1.5 animate-pulse rounded-full bg-primary" />
+                  Awaiting Approval
+                </Badge>
+              ) : (
+                <Badge className="gap-1.5 border-accent/30 bg-accent/15 text-accent hover:bg-accent/15">
+                  <span className="size-1.5 animate-pulse rounded-full bg-accent" />
+                  Agent Working
+                </Badge>
+              )}
             </div>
-            <p className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
-              <GitCommit className="size-4 shrink-0 text-accent" />
-              <span className="font-mono text-foreground">{pipeline.commit}</span>
-              <span className="truncate">{pipeline.commitMessage}</span>
-              <span className="text-muted-foreground/50">·</span>
-              <span>by {pipeline.author}</span>
-              <span className="text-muted-foreground/50">·</span>
-              <span className="font-mono">{pipeline.startedAt}</span>
-            </p>
+            {pipelineEvent && (
+              <p className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
+                <GitCommit className="size-4 shrink-0 text-accent" />
+                <span>{pipelineEvent.message}</span>
+              </p>
+            )}
           </div>
         </div>
 

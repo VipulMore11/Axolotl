@@ -29,20 +29,34 @@ class EventPublisher:
             event
         )
 
+        payload = {
+            "timestamp": (
+                event.timestamp.isoformat()
+            ),
+            "session_id": (
+                event.session_id
+            ),
+            "event_type": (
+                event.event_type
+            ),
+            "message": (
+                event.message
+            ),
+            "metadata": (
+                event.metadata
+            )
+        }
+
+        # Send to the pipeline-specific session
         await self.connection_manager.send_message(
             session_id=event.session_id,
-            payload={
-                "timestamp": (
-                    event.timestamp.isoformat()
-                ),
-                "event_type": (
-                    event.event_type
-                ),
-                "message": (
-                    event.message
-                ),
-                "metadata": (
-                    event.metadata
-                )
-            }
+            payload=payload
         )
+
+        # Also broadcast to the global 'dashboard' channel
+        # so the Overview page always receives events
+        if event.session_id != "dashboard":
+            await self.connection_manager.send_message(
+                session_id="dashboard",
+                payload=payload
+            )

@@ -213,6 +213,123 @@ class MongoDBService:
         """Lookup user by GitLab user ID."""
         return await self.db["users"].find_one({"gitlab_user_id": gitlab_user_id})
 
+    # ============ Events Collection Operations ============
+
+    async def log_event(self, event_data: Dict[str, Any]) -> str:
+        """Persist an orchestration event to the events collection."""
+        events = self.db["events"]
+        result = await events.insert_one(event_data)
+        return str(result.inserted_id)
+
+    async def get_events(
+        self,
+        user_id: Optional[str] = None,
+        limit: int = 50,
+        event_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query events, optionally filtered by user or type, newest first."""
+        events = self.db["events"]
+        query: Dict[str, Any] = {}
+        if user_id:
+            query["user_id"] = user_id
+        if event_type:
+            query["event_type"] = event_type
+
+        cursor = events.find(query).sort("timestamp", -1).limit(limit)
+        return await cursor.to_list(length=limit)
+
+    async def get_agent_metrics(self, user_id: Optional[str] = None) -> Dict[str, Any]:
+        """Compute aggregate agent metrics from the events collection."""
+        events = self.db["events"]
+        match_stage: Dict[str, Any] = {}
+        if user_id:
+            match_stage["user_id"] = user_id
+
+        pipeline_stages = []
+        if match_stage:
+            pipeline_stages.append({"$match": match_stage})
+        pipeline_stages.append({
+            "$group": {
+                "_id": None,
+                "total_events": {"$sum": 1},
+                "failures_detected": {
+                    "$sum": {"$cond": [{"$eq": ["$event_type", "pipeline_failed"]}, 1, 0]}
+                },
+                "fixes_generated": {
+                    "$sum": {"$cond": [{"$eq": ["$event_type", "generating_fix"]}, 1, 0]}
+                },
+                "mrs_created": {
+                    "$sum": {"$cond": [{"$eq": ["$event_type", "creating_mr"]}, 1, 0]}
+                },
+                "fixes_succeeded": {
+                    "$sum": {"$cond": [{"$eq": ["$event_type", "fix_succeeded"]}, 1, 0]}
+                },
+                "fixes_failed": {
+                    "$sum": {"$cond": [{"$eq": ["$event_type", "fix_failed"]}, 1, 0]}
+                },
+            }
+        })
+
+        results = await events.aggregate(pipeline_stages).to_list(length=1)
+        if results:
+            r = results[0]
+            total_fixes = r.get("fixes_succeeded", 0) + r.get("fixes_failed", 0)
+            success_rate = (
+                round(r["fixes_succeeded"] / total_fixes * 100, 1)
+                if total_fixes > 0
+                else 0
+            )
+            return {
+                "failures_detected": r.get("failures_detected", 0),
+                "fixes_generated": r.get("fixes_generated", 0),
+                "merge_requests_raised": r.get("mrs_created", 0),
+                "success_rate": success_rate,
+                "human_approved": r.get("fixes_succeeded", 0),
+                "auto_merged": 0,
+            }
+        return {
+            "failures_detected": 0,
+            "fixes_generated": 0,
+            "merge_requests_raised": 0,
+            "success_rate": 0,
+            "human_approved": 0,
+            "auto_merged": 0,
+        }
+
+    # ============ Settings Operations ============
+
+    async def get_user_settings(self, user_id: str) -> Dict[str, Any]:
+        """Get agent settings for a user. Returns defaults if not set."""
+        from bson import ObjectId
+        user = await self.db["users"].find_one({"_id": ObjectId(user_id)})
+        if not user:
+            return {}
+        return user.get("settings", {
+            "confidence_threshold": 85,
+            "require_approval": True,
+            "auto_branch": True,
+            "notify_failures": True,
+        })
+
+    async def update_user_settings(self, user_id: str, settings: Dict[str, Any]) -> bool:
+        """Update agent settings for a user."""
+        from bson import ObjectId
+        result = await self.db["users"].update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"settings": settings}}
+        )
+        return result.modified_count > 0
+
+    async def get_projects_for_user(self, user_id: str) -> List[Dict[str, Any]]:
+        """List all projects owned by / linked to a user."""
+        projects = self.db["projects"]
+        cursor = projects.find({"user_id": user_id})
+        results = []
+        async for project in cursor:
+            project["_id"] = str(project["_id"])
+            results.append(project)
+        return results
+
     @asynccontextmanager
     async def get_connection(self):
         """Context manager for database connection."""

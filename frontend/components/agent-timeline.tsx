@@ -1,4 +1,4 @@
-import { agentStages, type StageState } from "@/lib/axolotl-data"
+import type { AgentStage, StageState } from "@/lib/axolotl-data"
 import { Check, Loader2, Circle, X } from "lucide-react"
 
 function StageIcon({ state }: { state: StageState }) {
@@ -27,19 +27,26 @@ function StageIcon({ state }: { state: StageState }) {
   )
 }
 
-export function AgentTimeline() {
+interface AgentTimelineProps {
+  stages: AgentStage[]
+  completedCount: number
+}
+
+export function AgentTimeline({ stages, completedCount }: AgentTimelineProps) {
   return (
     <div className="rounded-lg border border-border bg-card">
       <div className="flex items-center justify-between border-b border-border px-4 py-3">
         <h2 className="text-sm font-semibold text-foreground">Agent Workflow</h2>
-        <span className="font-mono text-xs text-muted-foreground">7 / 8 stages</span>
+        <span className="font-mono text-xs text-muted-foreground">
+          {completedCount} / {stages.length} stages
+        </span>
       </div>
       <ol className="px-4 py-2">
-        {agentStages.map((stage, i) => (
+        {stages.map((stage, i) => (
           <li key={stage.key} className="relative flex gap-3 pb-1 pt-1">
             <div className="flex flex-col items-center">
               <StageIcon state={stage.state} />
-              {i < agentStages.length - 1 && (
+              {i < stages.length - 1 && (
                 <span
                   className={`my-0.5 w-px flex-1 ${
                     stage.state === "done" ? "bg-chart-3/30" : "bg-border"

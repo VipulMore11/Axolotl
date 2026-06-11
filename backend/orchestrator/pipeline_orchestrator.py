@@ -53,17 +53,25 @@ class PipelineOrchestrator:
         session_id: str = "system",
         metadata: Optional[dict] = None,
     ) -> None:
-        """Publish an orchestration event to WebSocket clients and observability."""
+        """Publish an orchestration event to WebSocket clients, observability, and MongoDB."""
         print(f"[EVENT] {event_type.value}: {message}")
 
+        event = Event(
+            timestamp=datetime.now(UTC),
+            session_id=session_id,
+            event_type=event_type.value,
+            message=message,
+            metadata=metadata,
+        )
+
+        # Persist to MongoDB for the Activity page
+        if self.mongo_service:
+            try:
+                await self.mongo_service.log_event(event.model_dump())
+            except Exception as e:
+                print(f"[EVENT] Failed to persist event: {e}")
+
         if self.event_publisher:
-            event = Event(
-                timestamp=datetime.now(UTC),
-                session_id=session_id,
-                event_type=event_type.value,
-                message=message,
-                metadata=metadata,
-            )
             await self.event_publisher.publish(event)
 
     # ─── MCP Client Connection ──────────────────────────────────────

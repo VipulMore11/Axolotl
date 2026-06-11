@@ -22,6 +22,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.debug_route import router as debug_router
 from api.websockets_route import router as websocket_router
 from api.webhook_routes import router as webhook_router
+from api.dashboard_routes import router as dashboard_router
+from api.pipeline_routes import router as pipeline_router
+from api.merge_request_routes import router as mr_router
+from api.activity_routes import router as activity_router
+from api.settings_routes import router as settings_router
 from auth.routes import router as auth_router
 from db.mongo_service import get_mongo_service
 
@@ -63,6 +68,11 @@ app.include_router(debug_router)
 app.include_router(websocket_router)
 app.include_router(webhook_router)
 app.include_router(auth_router)
+app.include_router(dashboard_router)
+app.include_router(pipeline_router)
+app.include_router(mr_router)
+app.include_router(activity_router)
+app.include_router(settings_router)
 
 
 # ── Health Check ─────────────────────────────────────────────────────

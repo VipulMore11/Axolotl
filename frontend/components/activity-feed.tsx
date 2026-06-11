@@ -1,4 +1,6 @@
-import { activityFeed, type ActivityEvent } from "@/lib/axolotl-data"
+"use client"
+
+import type { APIActivityEvent } from "@/lib/api"
 import { Badge } from "@/components/ui/badge"
 import {
   AlertTriangle,
@@ -11,7 +13,7 @@ import {
 } from "lucide-react"
 
 const config: Record<
-  ActivityEvent["type"],
+  string,
   { icon: typeof Brain; ring: string; label: string }
 > = {
   detection: { icon: AlertTriangle, ring: "border-destructive/40 bg-destructive/15 text-destructive", label: "Detection" },
@@ -23,13 +25,29 @@ const config: Record<
   rejected: { icon: XCircle, ring: "border-destructive/40 bg-destructive/15 text-destructive", label: "Rejected" },
 }
 
-export function ActivityFeed() {
+interface ActivityFeedProps {
+  events: APIActivityEvent[]
+}
+
+export function ActivityFeed({ events }: ActivityFeedProps) {
   return (
     <ol className="relative">
-      {activityFeed.map((ev, i) => {
-        const c = config[ev.type]
+      {events.map((ev, i) => {
+        const c = config[ev.type] || config.detection
         const Icon = c.icon
-        const last = i === activityFeed.length - 1
+        const last = i === events.length - 1
+        
+        const timeStr = ev.time
+          ? (() => {
+              try {
+                const d = new Date(ev.time)
+                return d.toLocaleTimeString("en-GB", { hour12: false }).slice(0, 8)
+              } catch {
+                return ev.time
+              }
+            })()
+          : ""
+
         return (
           <li key={ev.id} className="relative flex gap-4 pb-6 last:pb-0">
             {!last && (
@@ -43,14 +61,18 @@ export function ActivityFeed() {
             <div className="min-w-0 flex-1 rounded-lg border border-border bg-card px-4 py-3">
               <div className="flex flex-wrap items-center gap-2">
                 <p className="text-sm font-medium text-foreground">{ev.summary}</p>
-                <Badge variant="outline" className="font-mono text-[10px] text-muted-foreground">
-                  {ev.project}
-                </Badge>
-                <Badge variant="outline" className="font-mono text-[10px] text-accent/80">
-                  {ev.pipeline}
-                </Badge>
+                {ev.project && (
+                  <Badge variant="outline" className="font-mono text-[10px] text-muted-foreground">
+                    {ev.project}
+                  </Badge>
+                )}
+                {ev.pipeline && (
+                  <Badge variant="outline" className="font-mono text-[10px] text-accent/80">
+                    #{ev.pipeline}
+                  </Badge>
+                )}
                 <span className="ml-auto font-mono text-[11px] text-muted-foreground">
-                  {ev.time}
+                  {timeStr}
                 </span>
               </div>
               <p className="mt-1 text-pretty text-xs leading-relaxed text-muted-foreground">

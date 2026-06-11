@@ -2,10 +2,11 @@
 
 import { useState } from "react"
 import Link from "next/link"
-import { pipelines, type PipelineStatus } from "@/lib/axolotl-data"
+import type { APIPipeline } from "@/lib/api"
 import { StatusBadge } from "@/components/status-badge"
 import { AxolotlMark } from "@/components/axolotl-mark"
 import { GitCommit, GitBranch, Clock } from "lucide-react"
+import type { PipelineStatus } from "@/lib/axolotl-data"
 
 const filters: { label: string; value: PipelineStatus | "all" }[] = [
   { label: "All", value: "all" },
@@ -16,7 +17,29 @@ const filters: { label: string; value: PipelineStatus | "all" }[] = [
   { label: "Passed", value: "passed" },
 ]
 
-export function PipelinesTable() {
+function formatDuration(seconds: number | null): string {
+  if (seconds === null || seconds === undefined) return "—"
+  if (seconds < 60) return `${seconds}s`
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  return `${m}m ${s}s`
+}
+
+function formatTime(dateStr: string): string {
+  if (!dateStr) return "—"
+  try {
+    const d = new Date(dateStr)
+    return d.toLocaleTimeString("en-GB", { hour12: false }).slice(0, 8)
+  } catch {
+    return "—"
+  }
+}
+
+interface PipelinesTableProps {
+  pipelines: APIPipeline[]
+}
+
+export function PipelinesTable({ pipelines }: PipelinesTableProps) {
   const [filter, setFilter] = useState<PipelineStatus | "all">("all")
   const rows = pipelines.filter((p) => filter === "all" || p.status === filter)
 
@@ -51,44 +74,49 @@ export function PipelinesTable() {
           <span>Status</span>
           <span className="text-right">Duration</span>
         </div>
-        <ul>
-          {rows.map((p) => (
-            <li key={p.id}>
-              <Link
-                href="/"
-                className="grid grid-cols-1 gap-2 border-b border-border/60 px-4 py-3.5 transition-colors last:border-0 hover:bg-secondary/40 md:grid-cols-[110px_1fr_160px_120px_110px] md:items-center md:gap-4"
-              >
-                <div className="flex items-center gap-2 font-mono text-sm text-foreground">
-                  {p.agentEngaged && <AxolotlMark className="size-4 shrink-0" />}
-                  {p.id}
-                </div>
-                <div className="min-w-0">
-                  <div className="flex items-center gap-1.5 text-sm text-foreground">
-                    <GitCommit className="size-3.5 shrink-0 text-accent" />
-                    <span className="truncate">{p.commitMessage}</span>
+        {rows.length === 0 ? (
+          <div className="flex items-center justify-center px-4 py-12 text-sm text-muted-foreground">
+            No pipelines found.
+          </div>
+        ) : (
+          <ul>
+            {rows.map((p) => (
+              <li key={`${p.project_id}-${p.id}`}>
+                <Link
+                  href="/"
+                  className="grid grid-cols-1 gap-2 border-b border-border/60 px-4 py-3.5 transition-colors last:border-0 hover:bg-secondary/40 md:grid-cols-[110px_1fr_160px_120px_110px] md:items-center md:gap-4"
+                >
+                  <div className="flex items-center gap-2 font-mono text-sm text-foreground">
+                    {p.agent_engaged && <AxolotlMark className="size-4 shrink-0" />}
+                    #{p.id}
                   </div>
-                  <div className="mt-0.5 flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
-                    <span className="text-accent/70">{p.commit}</span>
-                    <span>by {p.author}</span>
-                    <span className="text-muted-foreground/40">·</span>
-                    <span>{p.project}</span>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5 text-sm text-foreground">
+                      <GitCommit className="size-3.5 shrink-0 text-accent" />
+                      <span className="truncate">{p.sha}</span>
+                    </div>
+                    <div className="mt-0.5 flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
+                      <span className="text-accent/70">{p.sha}</span>
+                      <span className="text-muted-foreground/40">·</span>
+                      <span>{p.project_name}</span>
+                    </div>
                   </div>
-                </div>
-                <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
-                  <GitBranch className="size-3.5 shrink-0" />
-                  <span className="truncate">{p.ref}</span>
-                </div>
-                <div>
-                  <StatusBadge status={p.status} />
-                </div>
-                <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground md:justify-end">
-                  <Clock className="size-3.5 md:hidden" />
-                  {p.duration}
-                </div>
-              </Link>
-            </li>
-          ))}
-        </ul>
+                  <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
+                    <GitBranch className="size-3.5 shrink-0" />
+                    <span className="truncate">{p.ref}</span>
+                  </div>
+                  <div>
+                    <StatusBadge status={p.status as PipelineStatus} />
+                  </div>
+                  <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground md:justify-end">
+                    <Clock className="size-3.5 md:hidden" />
+                    {formatDuration(p.duration)}
+                  </div>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   )

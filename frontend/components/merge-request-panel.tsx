@@ -1,50 +1,89 @@
 "use client"
 
-import { useState } from "react"
-import { mergeRequest, type DiffLine } from "@/lib/axolotl-data"
+import { useEffect, useState } from "react"
+import { getMergeRequests, approveMergeRequest, rejectMergeRequest, mergeMergeRequest, type APIMergeRequest } from "@/lib/api"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { AxolotlMark } from "@/components/axolotl-mark"
-import { Check, X, GitMerge, GitBranch, FileDiff, CheckCircle2, ArrowRight } from "lucide-react"
-
-function DiffRow({ line }: { line: DiffLine }) {
-  if (line.type === "meta") {
-    return (
-      <tr className="bg-accent/5">
-        <td colSpan={3} className="px-3 py-0.5 font-mono text-[11px] text-accent/80">
-          {line.text}
-        </td>
-      </tr>
-    )
-  }
-  const bg =
-    line.type === "add" ? "bg-chart-3/10" : line.type === "remove" ? "bg-destructive/10" : ""
-  const sign = line.type === "add" ? "+" : line.type === "remove" ? "-" : " "
-  const textColor =
-    line.type === "add"
-      ? "text-chart-3"
-      : line.type === "remove"
-        ? "text-destructive"
-        : "text-muted-foreground"
-  return (
-    <tr className={`group ${bg}`}>
-      <td className="w-10 select-none border-r border-border/40 px-2 py-0.5 text-right font-mono text-[11px] text-muted-foreground/40 tabular-nums">
-        {line.oldNo ?? ""}
-      </td>
-      <td className="w-10 select-none border-r border-border/40 px-2 py-0.5 text-right font-mono text-[11px] text-muted-foreground/40 tabular-nums">
-        {line.newNo ?? ""}
-      </td>
-      <td className={`whitespace-pre px-3 py-0.5 font-mono text-xs ${textColor}`}>
-        <span className="mr-2 select-none opacity-60">{sign}</span>
-        {line.text || " "}
-      </td>
-    </tr>
-  )
-}
+import { Check, X, GitMerge, GitBranch, FileDiff, CheckCircle2, ArrowRight, Loader2 } from "lucide-react"
 
 export function MergeRequestPanel() {
+  const [mr, setMr] = useState<APIMergeRequest | null>(null)
   const [decision, setDecision] = useState<"pending" | "approved" | "rejected">("pending")
-  const mr = mergeRequest
+  const [loading, setLoading] = useState(true)
+  const [acting, setActing] = useState(false)
+
+  useEffect(() => {
+    async function load() {
+      try {
+        const data = await getMergeRequests("opened")
+        // Find the first agent-raised open MR
+        const agentMr = data.merge_requests.find((m) => m.author_is_agent && m.status === "open")
+        if (agentMr) {
+          setMr(agentMr)
+        } else if (data.merge_requests.length > 0) {
+          setMr(data.merge_requests[0])
+        }
+      } catch (e) {
+        console.error("Failed to load MRs:", e)
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+  }, [])
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center rounded-lg border border-border bg-card p-8">
+        <div className="flex items-center gap-3 text-sm text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" />
+          Loading merge requests...
+        </div>
+      </div>
+    )
+  }
+
+  if (!mr) {
+    return (
+      <div className="flex flex-col items-center justify-center rounded-lg border border-border bg-card p-8 text-center">
+        <GitMerge className="size-8 text-muted-foreground/40 mb-2" />
+        <p className="text-sm text-muted-foreground">No open merge requests from the agent.</p>
+      </div>
+    )
+  }
+
+  async function handleApprove() {
+    if (!mr) return
+    setActing(true)
+    try {
+      await mergeMergeRequest(mr.project_id, mr.raw_iid)
+      setDecision("approved")
+    } catch (e) {
+      // Try approve if merge fails
+      try {
+        await approveMergeRequest(mr.project_id, mr.raw_iid)
+        setDecision("approved")
+      } catch {
+        console.error("Failed to approve:", e)
+      }
+    } finally {
+      setActing(false)
+    }
+  }
+
+  async function handleReject() {
+    if (!mr) return
+    setActing(true)
+    try {
+      await rejectMergeRequest(mr.project_id, mr.raw_iid)
+      setDecision("rejected")
+    } catch (e) {
+      console.error("Failed to reject:", e)
+    } finally {
+      setActing(false)
+    }
+  }
 
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-card">
@@ -57,7 +96,7 @@ export function MergeRequestPanel() {
               <span className="font-mono text-sm text-muted-foreground">{mr.iid}</span>
               {decision === "pending" && (
                 <Badge className="border-chart-3/30 bg-chart-3/15 text-chart-3 hover:bg-chart-3/15">
-                  Open
+                  {mr.status === "open" ? "Open" : mr.status === "merged" ? "Merged" : "Closed"}
                 </Badge>
               )}
               {decision === "approved" && (
@@ -81,28 +120,28 @@ export function MergeRequestPanel() {
         <div className="mt-3 flex flex-wrap items-center gap-2 font-mono text-xs">
           <span className="flex items-center gap-1.5 rounded-md border border-primary/30 bg-primary/10 px-2 py-1 text-primary">
             <GitBranch className="size-3.5" />
-            {mr.sourceBranch}
+            {mr.source_branch}
           </span>
           <ArrowRight className="size-3.5 text-muted-foreground" />
           <span className="flex items-center gap-1.5 rounded-md border border-border bg-secondary px-2 py-1 text-foreground">
             <GitBranch className="size-3.5" />
-            {mr.targetBranch}
+            {mr.target_branch}
           </span>
         </div>
 
         {/* meta row */}
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground">
           <span className="flex items-center gap-1.5">
-            <AxolotlMark className="size-4" />
+            {mr.author_is_agent ? <AxolotlMark className="size-4" /> : null}
             opened by <span className="text-foreground">{mr.author}</span>
           </span>
           <span className="flex items-center gap-1.5">
             <FileDiff className="size-3.5" />
-            {mr.filesChanged} file
+            {mr.files_changed} file{mr.files_changed !== 1 ? "s" : ""}
           </span>
           <span className="font-mono text-chart-3">+{mr.additions}</span>
           <span className="font-mono text-destructive">-{mr.deletions}</span>
-          {mr.pipelinePassing && (
+          {mr.pipeline_passing && (
             <span className="flex items-center gap-1.5 text-chart-3">
               <CheckCircle2 className="size-3.5" />
               checks passing
@@ -112,30 +151,11 @@ export function MergeRequestPanel() {
       </div>
 
       {/* description */}
-      <div className="border-b border-border bg-secondary/30 px-4 py-3 md:px-5">
-        <p className="text-sm leading-relaxed text-muted-foreground">{mr.description}</p>
-      </div>
-
-      {/* diff */}
-      <div className="border-b border-border">
-        <div className="flex items-center gap-2 border-b border-border bg-secondary/40 px-4 py-2 md:px-5">
-          <FileDiff className="size-3.5 text-accent" />
-          <span className="font-mono text-xs text-foreground">{mr.diffFile}</span>
-          <span className="ml-auto font-mono text-[11px] text-muted-foreground">
-            <span className="text-chart-3">+{mr.additions}</span>{" "}
-            <span className="text-destructive">-{mr.deletions}</span>
-          </span>
+      {mr.description && (
+        <div className="border-b border-border bg-secondary/30 px-4 py-3 md:px-5">
+          <p className="text-sm leading-relaxed text-muted-foreground line-clamp-3">{mr.description}</p>
         </div>
-        <div className="overflow-x-auto bg-[oklch(0.13_0.006_285)]">
-          <table className="w-full border-collapse">
-            <tbody>
-              {mr.diff.map((line, i) => (
-                <DiffRow key={i} line={line} />
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      )}
 
       {/* human-in-the-loop approval gate */}
       <div className="px-4 py-4 md:px-5">
@@ -167,7 +187,7 @@ export function MergeRequestPanel() {
                     : "Rejected — re-analyzing"}
               </p>
               <p className="text-xs text-muted-foreground">
-                {mr.approvalsGiven} of {mr.approvalsRequired} required approval
+                Review and approve to merge
               </p>
             </div>
           </div>
@@ -176,20 +196,20 @@ export function MergeRequestPanel() {
             <Button
               variant="outline"
               size="sm"
-              disabled={decision !== "pending"}
-              onClick={() => setDecision("rejected")}
+              disabled={decision !== "pending" || acting}
+              onClick={handleReject}
               className="border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive"
             >
-              <X className="size-4" />
+              {acting ? <Loader2 className="size-4 animate-spin" /> : <X className="size-4" />}
               Reject
             </Button>
             <Button
               size="sm"
-              disabled={decision !== "pending"}
-              onClick={() => setDecision("approved")}
+              disabled={decision !== "pending" || acting}
+              onClick={handleApprove}
               className="bg-primary text-primary-foreground hover:bg-primary/90"
             >
-              <GitMerge className="size-4" />
+              {acting ? <Loader2 className="size-4 animate-spin" /> : <GitMerge className="size-4" />}
               Approve &amp; Merge
             </Button>
           </div>

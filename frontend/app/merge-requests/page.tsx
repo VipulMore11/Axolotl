@@ -1,13 +1,34 @@
+"use client"
+
+import { useEffect, useState } from "react"
 import { TopBar } from "@/components/top-bar"
 import { PageHeader } from "@/components/page-header"
 import { MergeRequestPanel } from "@/components/merge-request-panel"
 import { MergeRequestList } from "@/components/merge-request-list"
-import { mergeRequests } from "@/lib/axolotl-data"
+import { getMergeRequests, type APIMergeRequest } from "@/lib/api"
+import { Loader2 } from "lucide-react"
 
 export default function MergeRequestsPage() {
+  const [mergeRequests, setMergeRequests] = useState<APIMergeRequest[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    async function load() {
+      try {
+        const data = await getMergeRequests()
+        setMergeRequests(data.merge_requests)
+      } catch (e) {
+        console.error("Failed to load merge requests:", e)
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+  }, [])
+
   const open = mergeRequests.filter((m) => m.status === "open").length
   const merged = mergeRequests.filter((m) => m.status === "merged").length
-  const agentRaised = mergeRequests.filter((m) => m.authorIsAgent).length
+  const agentRaised = mergeRequests.filter((m) => m.author_is_agent).length
 
   const stats = [
     { label: "Open", value: open },
@@ -30,7 +51,7 @@ export default function MergeRequestsPage() {
                   {s.label}
                 </div>
                 <div className="mt-1 font-mono text-2xl font-semibold text-foreground">
-                  {s.value}
+                  {loading ? "—" : s.value}
                 </div>
               </div>
             ))}
@@ -38,18 +59,29 @@ export default function MergeRequestsPage() {
         }
       />
       <main className="mx-auto flex w-full max-w-[1600px] flex-col gap-8 px-4 py-6 md:px-6">
-        <section>
-          <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
-            <span className="size-1.5 animate-pulse rounded-full bg-primary" />
-            Awaiting your approval
-          </h2>
-          <MergeRequestPanel />
-        </section>
+        {loading ? (
+          <div className="flex items-center justify-center py-16">
+            <div className="flex items-center gap-3 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" />
+              Loading merge requests...
+            </div>
+          </div>
+        ) : (
+          <>
+            <section>
+              <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
+                <span className="size-1.5 animate-pulse rounded-full bg-primary" />
+                Awaiting your approval
+              </h2>
+              <MergeRequestPanel />
+            </section>
 
-        <section>
-          <h2 className="mb-3 text-sm font-semibold text-foreground">All merge requests</h2>
-          <MergeRequestList />
-        </section>
+            <section>
+              <h2 className="mb-3 text-sm font-semibold text-foreground">All merge requests</h2>
+              <MergeRequestList mergeRequests={mergeRequests} />
+            </section>
+          </>
+        )}
       </main>
     </div>
   )
