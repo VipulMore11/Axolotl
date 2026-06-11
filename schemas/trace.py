@@ -1,11 +1,10 @@
 from pydantic import BaseModel
-from datetime import datetime
 from typing import Optional
 
 
-class Event(BaseModel):
-    timestamp: datetime
+class AgentTrace(BaseModel):
     session_id: str
-    event_type: str
-    message: str
+    input_data: str
+    reasoning: str
+    output_data: str
     metadata: Optional[dict] = None

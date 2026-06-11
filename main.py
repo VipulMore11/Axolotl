@@ -1,22 +1,9 @@
-import asyncio
+from fastapi import FastAPI
 
-from orchestrator.pipeline_orchestrator import PipelineOrchestrator
-from schemas.pipeline import PipelineFailure
+from api.debug_route import router as debug_router
+from api.websockets_route import router as websocket_router
 
+app = FastAPI()
 
-async def main() -> None:
-    orchestrator = PipelineOrchestrator()
-
-    failure = PipelineFailure(
-        project_id="demo-project",
-        pipeline_id="12345",
-        branch="main",
-        logs="ModuleNotFoundError: No module named 'pandas'",
-    )
-
-    result = await orchestrator.handle_failure(failure)
-    print(result)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+app.include_router(debug_router)
+app.include_router(websocket_router)
