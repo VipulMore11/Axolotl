@@ -43,6 +43,7 @@ class PipelineOrchestrator:
         self.ci_fix_agent = ci_fix_agent or CIFixAgent()
         self.event_publisher = event_publisher
         self.mongo_service = mongo_service
+        self.current_user_id: Optional[str] = None
 
     # ─── Event Publishing (bridges Person 4's EventPublisher) ───────
 
@@ -59,6 +60,7 @@ class PipelineOrchestrator:
         event = Event(
             timestamp=datetime.now(UTC),
             session_id=session_id,
+            user_id=self.current_user_id,
             event_type=event_type.value,
             message=message,
             metadata=metadata,
@@ -130,6 +132,7 @@ class PipelineOrchestrator:
         project_id: str,
         pipeline_id: str,
         branch: str,
+        user_id: Optional[str] = None,
     ) -> dict:
         """
         Run the complete pipeline fix workflow using MCP tools.
@@ -147,10 +150,12 @@ class PipelineOrchestrator:
             project_id: GitLab project ID
             pipeline_id: GitLab pipeline ID
             branch: Branch that failed
+            user_id: The user associated with this project
 
         Returns:
             Summary dict with workflow result
         """
+        self.current_user_id = user_id
         session_id = f"pipeline-{pipeline_id}"
         fix_branch = f"axolotl/fix/{pipeline_id}"
 

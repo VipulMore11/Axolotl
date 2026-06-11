@@ -117,7 +117,8 @@ async def handle_pipeline_webhook(request: Request, background_tasks: Background
             pipeline_id,
             session_id,
             branch,
-            commit_sha
+            commit_sha,
+            project_config.get("user_id")
         )
 
         return {
@@ -160,7 +161,8 @@ async def process_pipeline_failure(
     pipeline_id: str,
     session_id: str,
     branch: str,
-    commit_sha: Optional[str]
+    commit_sha: Optional[str],
+    user_id: Optional[str] = None
 ):
     """
     Process pipeline failure in the background.
@@ -171,6 +173,7 @@ async def process_pipeline_failure(
         pipeline_id: GitLab pipeline ID
         branch: Branch that failed
         commit_sha: Commit SHA
+        user_id: The owner of the project
     """
     print(f"Processing pipeline failure: Project {project_id}, Pipeline {pipeline_id}")
 
@@ -183,6 +186,7 @@ async def process_pipeline_failure(
             project_id=project_id,
             pipeline_id=pipeline_id,
             branch=branch,
+            user_id=user_id,
         )
         print(f"Pipeline fix workflow completed: {result}")
 

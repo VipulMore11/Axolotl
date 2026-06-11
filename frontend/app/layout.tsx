@@ -16,21 +16,8 @@ export const metadata: Metadata = {
     'Axolotl monitors GitLab CI/CD pipelines, diagnoses failures with Gemini, and raises fixes for human approval.',
   generator: 'v0.app',
   icons: {
-    icon: [
-      {
-        url: '/icon-light-32x32.png',
-        media: '(prefers-color-scheme: light)',
-      },
-      {
-        url: '/icon-dark-32x32.png',
-        media: '(prefers-color-scheme: dark)',
-      },
-      {
-        url: '/icon.svg',
-        type: 'image/svg+xml',
-      },
-    ],
-    apple: '/apple-icon.png',
+    icon: '/Axolotl(without-bg).png',
+    apple: '/Axolotl(without-bg).png',
   },
 }
 
