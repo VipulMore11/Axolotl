@@ -77,7 +77,7 @@ export default function LoginPage() {
           </div>
 
           <div className="grid gap-4">
-            <form action="http://localhost:8000/auth/gitlab/login" method="GET">
+            <form action={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/auth/gitlab/login`} method="GET">
               <Button type="submit" className="w-full bg-primary text-primary-foreground hover:bg-primary/90 h-11">
                 <svg
                   className="mr-2 size-5"

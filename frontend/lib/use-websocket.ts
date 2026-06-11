@@ -2,19 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react"
 
-const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000"
-
-function getWebSocketBase() {
-  if (typeof window !== "undefined") {
-    // If the browser is on localhost, ensure we use localhost for WS
-    // to avoid CORS/mixed-origin issues between localhost and 127.0.0.1
-    const host = window.location.hostname
-    if (host === "localhost" && WS_BASE.includes("127.0.0.1")) {
-      return WS_BASE.replace("127.0.0.1", "localhost")
-    }
-  }
-  return WS_BASE
-}
+const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || "ws://127.0.0.1:8000"
 
 export interface WSEvent {
   timestamp: string
@@ -64,7 +52,7 @@ export function useAxolotlSocket(
         return
       }
 
-      const url = `${getWebSocketBase()}/ws/${sessionId}`
+      const url = `${WS_BASE}/ws/${sessionId}`
       const ws = new WebSocket(url)
       wsRef.current = ws
 
