@@ -26,16 +26,16 @@ class CIFixAgentError(RuntimeError):
 class CIFixAgent(BaseAgent):
     """CI failure analysis agent backed by Gemini and ADK."""
 
-    def __init__(self, model: str = "gemini-2.5-flash") -> None:
+    def __init__(self) -> None:
         """Initialize the Gemini client and ADK agent wrapper."""
-        self.model = model
+        self.model = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not set")
         self.client = genai.Client(api_key=api_key)
         self.adk_agent = Agent(
             name="ci_fix_agent",
-            model=model,
+            model=self.model,
             instruction="You are a CI/CD failure analyst. Return only valid JSON.",
         )
 
