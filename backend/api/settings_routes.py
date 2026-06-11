@@ -207,9 +207,7 @@ async def add_watched_project(
                     headers={"Authorization": f"Bearer {gitlab_token}"},
                     json={
                         "url": webhook_url,
-                        "push_events": False,
                         "pipeline_events": True,
-                        "merge_requests_events": True,
                         "enable_ssl_verification": True,
                         "token": webhook_secret,
                     },
