@@ -102,7 +102,7 @@ async def gitlab_callback(code: str):
     jwt_token = create_access_token({"user_id": user_id})
 
     # Step 5: Redirect to frontend with token
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    frontend_url = os.getenv("FRONTEND_URL")
     redirect_url = f"{frontend_url}/auth/callback?token={jwt_token}"
 
     return RedirectResponse(url=redirect_url, status_code=302)
