@@ -42,13 +42,18 @@ class CIFixAgent(BaseAgent):
     @override
     async def analyze(self, failure: PipelineFailure) -> FixProposal:
         """Analyze a pipeline failure and return a structured fix proposal."""
+        print(f"[DEBUG] ci_fix_agent.analyze called | project_id={failure.project_id} | pipeline_id={failure.pipeline_id}")
         try:
+            print(f"[DEBUG] Building prompt for Gemini. Log length: {len(failure.logs)}")
             prompt = PromptBuilder.build_prompt(failure)
+            
+            print(f"[DEBUG] Calling Gemini API with model: {self.model}")
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model=self.model,
                 contents=prompt,
             )
+            print("[DEBUG] Gemini API returned successfully")
             content = getattr(response, "text", "") or ""
             if not content:
                 raise ValueError("Gemini returned an empty response")
