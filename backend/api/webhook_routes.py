@@ -7,13 +7,23 @@ Receives pipeline failure notifications and triggers the agent workflow.
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from typing import Optional
 import json
+import time
 
 from db.mongo_service import get_mongo_service
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
+# ── Circuit-breaker state ────────────────────────────────────────────
+# Tracks pipeline IDs that have already been processed (or are in-flight)
+# and per-project cooldowns to prevent infinite loops.
+
+_processed_pipelines: set[str] = set()          # pipeline IDs we've already seen
+_project_cooldowns: dict[str, float] = {}       # project_id → timestamp of last run
+PROJECT_COOLDOWN_SECONDS = 60                   # minimum gap between runs per project
+MAX_PROCESSED_CACHE = 500                       # prevent unbounded memory growth
+
 @router.post("/gitlab/test")
-async def handle_pipeline_webhook(
+async def handle_test_webhook(
     request: Request
 ):
     payload = await request.json()
@@ -31,6 +41,13 @@ async def handle_pipeline_webhook(request: Request, background_tasks: Background
 
     This endpoint receives pipeline failure notifications and triggers the agent workflow
     via the orchestrator.
+
+    Circuit-breaker guards:
+      1. Ignore non-pipeline events
+      2. Ignore pipelines that did NOT fail
+      3. Ignore failures on axolotl/* branches (our own fix branches)
+      4. Ignore duplicate pipeline IDs (already processed or in-flight)
+      5. Enforce a per-project cooldown to prevent rapid-fire loops
     """
     try:
         # Get raw body
@@ -39,49 +56,64 @@ async def handle_pipeline_webhook(request: Request, background_tasks: Background
         # Parse JSON payload
         payload = json.loads(body)
 
-        # Filter for pipeline events
+        # Guard 1: Only pipeline events
         if payload.get("object_kind") != "pipeline":
             return {"status": "ignored", "reason": "not a pipeline event"}
 
-        object_attributes = payload.get(
-            "object_attributes",
-            {}
-        )
+        object_attributes = payload.get("object_attributes", {})
+        status = object_attributes.get("status")
 
-        status = object_attributes.get(
-            "status"
-        )
-
+        # Guard 2: Only failed pipelines
         if status != "failed":
+            return {"status": "ignored", "reason": "pipeline did not fail"}
+
+        project = payload.get("project", {})
+        project_id = str(project.get("id"))
+        pipeline_id = str(object_attributes.get("id"))
+        branch = object_attributes.get("ref")
+        commit_sha = object_attributes.get("sha")
+
+        print(f"[WEBHOOK] Pipeline failure detected: Project {project_id}, Pipeline {pipeline_id}, Branch {branch}")
+
+        # ── Guard 3: Skip failures on Axolotl's own fix branches ─────
+        if branch and branch.startswith("axolotl/"):
+            print(f"[WEBHOOK] SKIPPED — failure is on Axolotl fix branch '{branch}', ignoring to prevent loop")
             return {
                 "status": "ignored",
-                "reason": "pipeline did not fail"
+                "reason": f"Pipeline failed on Axolotl fix branch '{branch}' — not re-processing",
             }
 
-        project = payload.get(
-            "project",
-            {}
-        )
+        # ── Guard 4: Deduplicate — skip if this pipeline was already handled ──
+        if pipeline_id in _processed_pipelines:
+            print(f"[WEBHOOK] SKIPPED — pipeline {pipeline_id} already processed")
+            return {
+                "status": "ignored",
+                "reason": f"Pipeline {pipeline_id} already processed or in-flight",
+            }
 
-        project_id = str(
-            project.get("id")
-        )
+        # ── Guard 5: Per-project cooldown ─────────────────────────────
+        now = time.time()
+        last_run = _project_cooldowns.get(project_id, 0)
+        if now - last_run < PROJECT_COOLDOWN_SECONDS:
+            remaining = int(PROJECT_COOLDOWN_SECONDS - (now - last_run))
+            print(f"[WEBHOOK] SKIPPED — project {project_id} is in cooldown ({remaining}s remaining)")
+            return {
+                "status": "ignored",
+                "reason": f"Project {project_id} in cooldown — {remaining}s remaining before next run",
+            }
 
-        pipeline_id = str(
-            object_attributes.get("id")
-        )
+        # ── Mark as in-flight ─────────────────────────────────────────
+        _processed_pipelines.add(pipeline_id)
+        _project_cooldowns[project_id] = now
 
-        branch = object_attributes.get(
-            "ref"
-        )
-
-        commit_sha = object_attributes.get(
-            "sha"
-        )
+        # Prevent unbounded memory growth
+        if len(_processed_pipelines) > MAX_PROCESSED_CACHE:
+            # Remove oldest entries (set doesn't preserve order, just trim)
+            excess = len(_processed_pipelines) - MAX_PROCESSED_CACHE
+            for _ in range(excess):
+                _processed_pipelines.pop()
 
         session_id = pipeline_id
-
-        print(f"Pipeline failure detected: Project {project_id}, Pipeline {pipeline_id}, Branch {branch}")
 
         # Verify project exists in MongoDB
         mongo_service = get_mongo_service()
@@ -105,6 +137,7 @@ async def handle_pipeline_webhook(request: Request, background_tasks: Background
 
         if not project_config:
             print(f"Project {project_id} not found in MongoDB")
+            _processed_pipelines.discard(pipeline_id)  # allow retry since we didn't actually run
             return {
                 "status": "error",
                 "reason": f"Project {project_id} not configured in system"
