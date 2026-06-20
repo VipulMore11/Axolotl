@@ -111,6 +111,12 @@ export default function SettingsPage() {
     try {
       const data = await getGitLabRepos(search, 1, 30)
       setRepos(data.repos)
+      if (typeof pendo !== "undefined") {
+        pendo.track("repository_search_executed", {
+          search_query: search,
+          results_count: data.repos.length,
+        })
+      }
     } catch (e) {
       console.error("Failed to fetch repos:", e)
     } finally {
@@ -139,6 +145,14 @@ export default function SettingsPage() {
       await updateAgentSettings(settings)
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
+      if (typeof pendo !== "undefined") {
+        pendo.track("agent_settings_saved", {
+          confidence_threshold: settings.confidence_threshold,
+          require_approval: settings.require_approval,
+          auto_branch: settings.auto_branch,
+          notify_failures: settings.notify_failures,
+        })
+      }
     } catch (e) {
       console.error("Failed to save:", e)
     } finally {
@@ -157,6 +171,17 @@ export default function SettingsPage() {
       // Refresh projects list
       const data = await getWatchedProjects()
       setProjects(data.projects)
+      if (typeof pendo !== "undefined") {
+        pendo.track("repository_connected", {
+          repo_id: String(repo.id),
+          repo_name: repo.path_with_namespace,
+          repo_visibility: repo.visibility,
+          default_branch: repo.default_branch,
+          webhook_registered: result.webhook_registered,
+          star_count: repo.star_count,
+          forks_count: repo.forks_count,
+        })
+      }
     } catch (e) {
       console.error("Failed to connect repo:", e)
     } finally {
@@ -170,12 +195,19 @@ export default function SettingsPage() {
       setProjects((prev) =>
         prev.map((p) => (p.project_id === projectId ? { ...p, auto_fix: autoFix } : p))
       )
+      if (typeof pendo !== "undefined") {
+        pendo.track("auto_fix_toggled", {
+          project_id: projectId,
+          auto_fix_enabled: autoFix,
+        })
+      }
     } catch (e) {
       console.error("Failed to update project:", e)
     }
   }
 
   async function handleDeleteProject(projectId: string) {
+    const project = projects.find((p) => p.project_id === projectId)
     try {
       await deleteWatchedProject(projectId)
       setProjects((prev) => prev.filter((p) => p.project_id !== projectId))
@@ -185,6 +217,12 @@ export default function SettingsPage() {
           String(r.id) === projectId ? { ...r, already_connected: false } : r
         )
       )
+      if (typeof pendo !== "undefined") {
+        pendo.track("repository_disconnected", {
+          project_id: projectId,
+          project_name: project?.project_name || "",
+        })
+      }
     } catch (e) {
       console.error("Failed to delete project:", e)
     }

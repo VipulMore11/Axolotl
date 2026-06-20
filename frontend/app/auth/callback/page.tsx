@@ -12,6 +12,13 @@ function CallbackContent() {
   useEffect(() => {
     if (token) {
       setToken(token)
+
+      if (typeof pendo !== "undefined") {
+        pendo.track("login_completed", {
+          auth_method: "gitlab_oauth",
+        })
+      }
+
       // Redirect to dashboard after a brief delay to allow token to settle
       setTimeout(() => {
         router.push("/")

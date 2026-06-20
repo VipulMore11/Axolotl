@@ -25,6 +25,7 @@ from schemas.events import Event
 from schemas.fix import FixProposal
 from schemas.pipeline import PipelineFailure
 from schemas.trace import AgentTrace
+from core.pendo_track import pendo_track
 from ws.event_publisher import EventPublisher
 
 
@@ -213,6 +214,17 @@ class PipelineOrchestrator:
                         "Could not retrieve pipeline logs or no failed jobs found.",
                         session_id=session_id,
                     )
+                    await pendo_track(
+                        event="pipeline_fix_failed",
+                        visitor_id=user_id,
+                        account_id=user_id,
+                        properties={
+                            "project_id": project_id,
+                            "pipeline_id": pipeline_id,
+                            "failure_reason": "no_logs",
+                            "failed_step": "fetch_logs",
+                        },
+                    )
                     return {"status": "failed", "reason": "no_logs"}
 
                 # Combine all job traces into a single log string
@@ -245,6 +257,17 @@ class PipelineOrchestrator:
                         EventType.FIX_FAILED,
                         f"AI analysis failed: {e}",
                         session_id=session_id,
+                    )
+                    await pendo_track(
+                        event="pipeline_fix_failed",
+                        visitor_id=user_id,
+                        account_id=user_id,
+                        properties={
+                            "project_id": project_id,
+                            "pipeline_id": pipeline_id,
+                            "failure_reason": str(e)[:200],
+                            "failed_step": "ai_analysis",
+                        },
                     )
                     return {"status": "failed", "reason": str(e)}
 
@@ -285,6 +308,17 @@ class PipelineOrchestrator:
                         f"Failed to create branch '{fix_branch}'.",
                         session_id=session_id,
                     )
+                    await pendo_track(
+                        event="pipeline_fix_failed",
+                        visitor_id=user_id,
+                        account_id=user_id,
+                        properties={
+                            "project_id": project_id,
+                            "pipeline_id": pipeline_id,
+                            "failure_reason": "branch_creation_failed",
+                            "failed_step": "create_branch",
+                        },
+                    )
                     return {"status": "failed", "reason": "branch_creation_failed"}
 
                 # ── Step 4: Commit the fix ──────────────────────────
@@ -308,6 +342,17 @@ class PipelineOrchestrator:
                         EventType.FIX_FAILED,
                         f"Failed to commit fix to {fix.file_path}.",
                         session_id=session_id,
+                    )
+                    await pendo_track(
+                        event="pipeline_fix_failed",
+                        visitor_id=user_id,
+                        account_id=user_id,
+                        properties={
+                            "project_id": project_id,
+                            "pipeline_id": pipeline_id,
+                            "failure_reason": "commit_failed",
+                            "failed_step": "commit_fix",
+                        },
                     )
                     return {"status": "failed", "reason": "commit_failed"}
 
@@ -344,6 +389,17 @@ class PipelineOrchestrator:
                         "Failed to create merge request.",
                         session_id=session_id,
                     )
+                    await pendo_track(
+                        event="pipeline_fix_failed",
+                        visitor_id=user_id,
+                        account_id=user_id,
+                        properties={
+                            "project_id": project_id,
+                            "pipeline_id": pipeline_id,
+                            "failure_reason": "mr_creation_failed",
+                            "failed_step": "create_mr",
+                        },
+                    )
                     return {"status": "failed", "reason": "mr_creation_failed"}
 
                 # ── Step 6: Success ─────────────────────────────────
@@ -352,6 +408,22 @@ class PipelineOrchestrator:
                     f"Merge request created! Awaiting human approval. URL: {mr_result.get('web_url', 'N/A')}",
                     session_id=session_id,
                     metadata=mr_result,
+                )
+
+                await pendo_track(
+                    event="pipeline_fix_completed",
+                    visitor_id=user_id,
+                    account_id=user_id,
+                    properties={
+                        "project_id": project_id,
+                        "pipeline_id": pipeline_id,
+                        "branch": branch,
+                        "fix_branch": fix_branch,
+                        "root_cause": fix.root_cause[:200],
+                        "file_path": fix.file_path,
+                        "commit_message": fix.commit_message[:200],
+                        "mr_web_url": mr_result.get("web_url", ""),
+                    },
                 )
 
                 return {

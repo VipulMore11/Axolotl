@@ -59,11 +59,39 @@ export function MergeRequestPanel() {
     try {
       await mergeMergeRequest(mr.project_id, mr.raw_iid)
       setDecision("approved")
+      if (typeof pendo !== "undefined") {
+        pendo.track("merge_request_approved", {
+          project_id: mr.project_id,
+          mr_iid: String(mr.raw_iid),
+          mr_title: mr.title,
+          source_branch: mr.source_branch,
+          target_branch: mr.target_branch,
+          files_changed: mr.files_changed,
+          additions: mr.additions,
+          deletions: mr.deletions,
+          author_is_agent: mr.author_is_agent,
+          pipeline_passing: mr.pipeline_passing,
+        })
+      }
     } catch (e) {
       // Try approve if merge fails
       try {
         await approveMergeRequest(mr.project_id, mr.raw_iid)
         setDecision("approved")
+        if (typeof pendo !== "undefined") {
+          pendo.track("merge_request_approved", {
+            project_id: mr.project_id,
+            mr_iid: String(mr.raw_iid),
+            mr_title: mr.title,
+            source_branch: mr.source_branch,
+            target_branch: mr.target_branch,
+            files_changed: mr.files_changed,
+            additions: mr.additions,
+            deletions: mr.deletions,
+            author_is_agent: mr.author_is_agent,
+            pipeline_passing: mr.pipeline_passing,
+          })
+        }
       } catch {
         console.error("Failed to approve:", e)
       }
@@ -78,6 +106,19 @@ export function MergeRequestPanel() {
     try {
       await rejectMergeRequest(mr.project_id, mr.raw_iid)
       setDecision("rejected")
+      if (typeof pendo !== "undefined") {
+        pendo.track("merge_request_rejected", {
+          project_id: mr.project_id,
+          mr_iid: String(mr.raw_iid),
+          mr_title: mr.title,
+          source_branch: mr.source_branch,
+          target_branch: mr.target_branch,
+          files_changed: mr.files_changed,
+          additions: mr.additions,
+          deletions: mr.deletions,
+          author_is_agent: mr.author_is_agent,
+        })
+      }
     } catch (e) {
       console.error("Failed to reject:", e)
     } finally {
