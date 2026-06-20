@@ -154,6 +154,17 @@ async def handle_pipeline_webhook(request: Request, background_tasks: Background
             project_config.get("user_id")
         )
 
+        # Track pipeline failure received in Pendo
+        user_id = project_config.get("user_id")
+        background_tasks.add_task(
+            _track_pipeline_failure_received,
+            project_id,
+            pipeline_id,
+            branch,
+            commit_sha,
+            user_id,
+        )
+
         return {
             "status": "received",
             "project_id": project_id,
@@ -187,6 +198,27 @@ async def handle_push_webhook(request: Request):
     except Exception as e:
         print(f"Error handling push webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _track_pipeline_failure_received(
+    project_id: str,
+    pipeline_id: str,
+    branch: str,
+    commit_sha: Optional[str],
+    user_id: Optional[str],
+):
+    from core.pendo_track import pendo_track
+    await pendo_track(
+        event="pipeline_failure_received",
+        visitor_id=user_id,
+        account_id=user_id,
+        properties={
+            "project_id": project_id,
+            "pipeline_id": pipeline_id,
+            "branch": branch or "",
+            "commit_sha": commit_sha or "",
+        },
+    )
 
 
 async def process_pipeline_failure(

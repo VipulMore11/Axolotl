@@ -84,6 +84,12 @@ export async function logout(): Promise<void> {
       // Ignore backend errors on logout
     }
   }
+
+  if (typeof pendo !== "undefined") {
+    pendo.track("user_logged_out", {
+      logout_source: "manual",
+    })
+  }
   
   removeToken()
   if (typeof window !== "undefined") {
