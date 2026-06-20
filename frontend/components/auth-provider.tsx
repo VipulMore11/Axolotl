@@ -1,6 +1,6 @@
 "use client"
 
-import React, { createContext, useContext, useEffect, useState } from "react"
+import React, { createContext, useContext, useEffect, useRef, useState } from "react"
 import { usePathname, useRouter } from "next/navigation"
 import { getUserProfile, isAuthenticated, logout } from "@/lib/auth"
 
@@ -33,6 +33,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isLoading, setIsLoading] = useState(true)
   const pathname = usePathname()
   const router = useRouter()
+  const pendoInitialized = useRef(false)
+
+  useEffect(() => {
+    if (!pendoInitialized.current) {
+      pendo.initialize({ visitor: { id: '' } })
+      pendoInitialized.current = true
+    }
+  }, [])
 
   useEffect(() => {
     // Don't check auth on public pages (login, callback)
@@ -53,6 +61,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (isMounted) {
         if (profile) {
           setUser(profile)
+          pendo.identify({
+            visitor: {
+              id: profile.id,
+              full_name: profile.name,
+              gitlabUserId: profile.gitlab_user_id,
+              username: profile.username,
+              avatarUrl: profile.avatar_url,
+            },
+          })
         } else {
           router.push("/login")
         }
@@ -68,6 +85,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [pathname, router])
 
   const handleLogout = () => {
+    pendo.clearSession()
     logout()
     setUser(null)
   }
