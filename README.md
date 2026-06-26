@@ -6,6 +6,7 @@
 
 **Axolotl** is an autonomous software engineering agent that watches your GitLab CI/CD pipelines.  
 The moment a pipeline fails, Axolotl springs into action: it fetches logs, analyzes the root cause with Gemini AI, writes the fix, opens a Merge Request, and waits for your approval — all in under a minute.
+### 🚀 Live Demo - https://axolotl-hvh1.onrender.com/
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black?style=flat-square&logo=next.js)](https://nextjs.org)
