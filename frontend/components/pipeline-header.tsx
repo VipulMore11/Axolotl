@@ -63,12 +63,12 @@ export function PipelineHeader({ sessionId, events, isConnected }: PipelineHeade
       icon: Clock,
       tone: isComplete ? "text-chart-4" : "text-accent",
     },
-    {
-      label: "Model",
-      value: "gemini-2.5-pro",
-      icon: Bot,
-      tone: "text-foreground",
-    },
+    // {
+    //   label: "Model",
+    //   value: "gemini-2.5-pro",
+    //   icon: Bot,
+    //   tone: "text-foreground",
+    // },
     {
       label: "Connection",
       value: isConnected ? "Live" : "Offline",
@@ -107,7 +107,7 @@ export function PipelineHeader({ sessionId, events, isConnected }: PipelineHeade
           </div>
         </div>
 
-        <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-3">
           {stats.map((s) => (
             <div
               key={s.label}

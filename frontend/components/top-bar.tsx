@@ -1,6 +1,8 @@
 "use client"
 
+import { useEffect, useState } from "react"
 import Link from "next/link"
+import { getWatchedProjects, type APIProject } from "@/lib/api"
 import { usePathname } from "next/navigation"
 import { AxolotlMark } from "@/components/axolotl-mark"
 import { Badge } from "@/components/ui/badge"
@@ -19,7 +21,25 @@ const navItems = [
 export function TopBar() {
   const pathname = usePathname()
   const { user, logout } = useAuth()
-  
+  const [project, setProject] = useState<APIProject | null>(null)
+
+  useEffect(() => {
+    if (!user) return
+    let isMounted = true
+    async function fetchProject() {
+      try {
+        const res = await getWatchedProjects()
+        if (isMounted && res.projects && res.projects.length > 0) {
+          setProject(res.projects[0])
+        }
+      } catch (err) {
+        console.error("Failed to fetch project for top bar", err)
+      }
+    }
+    fetchProject()
+    return () => { isMounted = false }
+  }, [user])
+
   const getInitials = (name: string) => {
     return name
       .split(' ')
@@ -45,9 +65,9 @@ export function TopBar() {
 
         <div className="mx-2 hidden items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1 font-mono text-xs text-muted-foreground lg:flex">
           <GitBranch className="size-3.5 text-accent" />
-          <span className="text-foreground">platform-api</span>
+          <span className="text-foreground">{project ? project.project_name.split("/").pop() : "..."}</span>
           <span className="text-muted-foreground/50">/</span>
-          <span>main</span>
+          <span>{project ? project.branch : "..."}</span>
         </div>
 
         <nav className="ml-auto hidden items-center gap-1 md:flex">
@@ -57,11 +77,10 @@ export function TopBar() {
               <Link
                 key={item.label}
                 href={item.href}
-                className={`rounded-md px-3 py-1.5 text-sm transition-colors ${
-                  active
-                    ? "bg-secondary text-foreground"
-                    : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground"
-                }`}
+                className={`rounded-md px-3 py-1.5 text-sm transition-colors ${active
+                  ? "bg-secondary text-foreground"
+                  : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground"
+                  }`}
               >
                 {item.label}
               </Link>
@@ -70,20 +89,6 @@ export function TopBar() {
         </nav>
 
         <div className="ml-auto flex items-center gap-1 md:ml-3">
-          <button className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground">
-            <BookOpen className="size-4" />
-            <span className="sr-only">Docs</span>
-          </button>
-          <button className="relative rounded-md p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground">
-            <Bell className="size-4" />
-            <span className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-primary" />
-            <span className="sr-only">Notifications</span>
-          </button>
-          <button className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground">
-            <Settings className="size-4" />
-            <span className="sr-only">Settings</span>
-          </button>
-          
           <div className="ml-2 flex items-center gap-2 border-l border-border pl-4">
             {user && (
               <div className="hidden flex-col items-end sm:flex mr-1">
@@ -97,7 +102,7 @@ export function TopBar() {
                 {user?.name ? getInitials(user.name) : "AX"}
               </AvatarFallback>
             </Avatar>
-            <button 
+            <button
               onClick={() => logout()}
               className="ml-1 rounded-md p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-destructive"
               title="Logout"
