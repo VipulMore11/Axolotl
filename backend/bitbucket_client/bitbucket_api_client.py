@@ -1,16 +1,23 @@
 """
-Bitbucket API Client
-Handles authentication and communication with Bitbucket Cloud REST API 2.0
-using credentials from MongoDB.
+Bitbucket API Client (POC — App Password Auth)
+Handles communication with Bitbucket Cloud REST API 2.0
+using App Password (HTTP Basic Auth) from environment variables.
+
+No OAuth required. Credentials come from:
+  - BITBUCKET_USERNAME  (env)
+  - BITBUCKET_APP_PASSWORD (env)
+  - BITBUCKET_WORKSPACE (env, default workspace)
 """
 
-from typing import Optional, Dict, Any, List
+import os
+from typing import Optional, Dict, Any
+
 import httpx
 from db.mongo_service import MongoDBService
 
 
 class BitbucketAPIClient:
-    """Bitbucket Cloud client that retrieves credentials from MongoDB."""
+    """Bitbucket Cloud client using App Password (HTTP Basic Auth)."""
 
     BASE_URL = "https://api.bitbucket.org/2.0"
 
@@ -19,71 +26,49 @@ class BitbucketAPIClient:
         Initialize Bitbucket API Client.
 
         Args:
-            mongo_service: MongoDBService instance for credential lookup
+            mongo_service: MongoDBService instance for project config lookup
         """
         self.mongo_service = mongo_service
-        self._tokens: Dict[str, str] = {}  # Cache tokens by project_id
+        self._username = os.getenv("BITBUCKET_USERNAME", "")
+        self._app_password = os.getenv("BITBUCKET_APP_PASSWORD", "")
+        self._default_workspace = os.getenv("BITBUCKET_WORKSPACE", "")
 
-    async def _get_auth_headers(self, project_id: str) -> Optional[Dict[str, str]]:
+        if not self._username or not self._app_password:
+            print("[WARN] BITBUCKET_USERNAME or BITBUCKET_APP_PASSWORD not set in .env")
+
+    @property
+    def _auth(self) -> tuple[str, str]:
+        """HTTP Basic Auth tuple for httpx."""
+        return (self._username, self._app_password)
+
+    async def _get_repo_path(self, project_id: str) -> str:
         """
-        Get authorization headers for a Bitbucket project.
+        Resolve workspace/repo_slug from project_id.
 
-        Resolves the access token from the linked user (OAuth) or falls back
-        to the app password stored on the project itself.
-
-        Args:
-            project_id: Internal project ID (stored in MongoDB)
-
-        Returns:
-            Dict with Authorization header, or None if project not found
+        Tries:
+          1. Project config in MongoDB (workspace + repo_slug fields)
+          2. project_id itself if it looks like "workspace/repo_slug"
+          3. BITBUCKET_WORKSPACE env + project_id as repo_slug
         """
-        print(f"[DEBUG] _get_auth_headers called | project_id={project_id}")
-
-        # Check cache first
-        if project_id in self._tokens:
-            print(f"[DEBUG] Using cached Bitbucket token for project {project_id}")
-            return {"Authorization": f"Bearer {self._tokens[project_id]}"}
-
-        # Retrieve project configuration from MongoDB
         project_config = await self.mongo_service.get_project_by_id(project_id)
-        if not project_config:
-            print(f"[ERROR] Project {project_id} not found in MongoDB")
-            return None
+        if project_config:
+            workspace = project_config.get("workspace", "")
+            repo_slug = project_config.get("repo_slug", "")
+            if workspace and repo_slug:
+                return f"{workspace}/{repo_slug}"
 
-        # Resolve token: prefer user's OAuth token, fall back to project-level app password
-        access_token = ""
-        if "user_id" in project_config:
-            user = await self.mongo_service.get_user_by_id(project_config["user_id"])
-            if user:
-                access_token = user.get("access_token", "")
-                print(f"[DEBUG] Using OAuth token from linked user {user.get('username')}")
-            else:
-                print(f"[WARN] Linked user {project_config['user_id']} not found. Falling back to project token.")
-                access_token = project_config.get("access_token", "")
-        else:
-            access_token = project_config.get("access_token", "")
+        # project_id might already be "workspace/repo_slug"
+        if "/" in project_id:
+            return project_id
 
-        if not access_token:
-            print(f"[ERROR] No access token found for project {project_id}")
-            return None
+        # Fallback to default workspace
+        if self._default_workspace:
+            return f"{self._default_workspace}/{project_id}"
 
-        token_preview = f"{access_token[:10]}...{access_token[-4:]}" if len(access_token) > 14 else "***"
-        print(
-            f"[DEBUG] MongoDB config for project {project_id}:\n"
-            f"  workspace  = {project_config.get('workspace')}\n"
-            f"  repo_slug  = {project_config.get('repo_slug')}\n"
-            f"  token      = {token_preview}\n"
-            f"  project_name = {project_config.get('project_name', 'N/A')}"
+        raise RuntimeError(
+            f"Cannot resolve repo path for project {project_id}. "
+            f"Set BITBUCKET_WORKSPACE in .env or store workspace/repo_slug in MongoDB."
         )
-
-        self._tokens[project_id] = access_token
-        return {"Authorization": f"Bearer {access_token}"}
-
-    def _get_project_repo_path(self, project_config: Dict[str, Any]) -> str:
-        """Build the workspace/repo_slug path from project config."""
-        workspace = project_config.get("workspace", "")
-        repo_slug = project_config.get("repo_slug", "")
-        return f"{workspace}/{repo_slug}"
 
     async def get_pipeline_logs(
         self, project_id: str, pipeline_uuid: str
@@ -103,22 +88,14 @@ class BitbucketAPIClient:
             f"project_id={project_id} | pipeline_uuid={pipeline_uuid}"
         )
 
-        headers = await self._get_auth_headers(project_id)
-        if not headers:
-            raise RuntimeError(
-                f"Failed to get auth for project {project_id} — check MongoDB config"
-            )
-
-        project_config = await self.mongo_service.get_project_by_id(project_id)
-        repo_path = self._get_project_repo_path(project_config)
+        repo_path = await self._get_repo_path(project_id)
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, auth=self._auth) as client:
                 # Fetch pipeline steps
                 print(f"[DEBUG] Fetching steps for pipeline {pipeline_uuid}")
                 steps_resp = await client.get(
                     f"{self.BASE_URL}/repositories/{repo_path}/pipelines/{pipeline_uuid}/steps/",
-                    headers=headers,
                     params={"pagelen": 100},
                 )
                 steps_resp.raise_for_status()
@@ -133,7 +110,7 @@ class BitbucketAPIClient:
                     step_status = result.get("name", state.get("name", "unknown"))
                     print(f"[DEBUG] Step '{step_name}' | status={step_status}")
 
-                # Filter for failed steps
+                # Poll for failed steps (pipeline may still be completing)
                 import asyncio
 
                 failed_steps = []
@@ -142,7 +119,6 @@ class BitbucketAPIClient:
                 for attempt in range(max_retries):
                     steps_resp = await client.get(
                         f"{self.BASE_URL}/repositories/{repo_path}/pipelines/{pipeline_uuid}/steps/",
-                        headers=headers,
                         params={"pagelen": 100},
                     )
                     steps_resp.raise_for_status()
@@ -174,7 +150,6 @@ class BitbucketAPIClient:
                     try:
                         log_resp = await client.get(
                             f"{self.BASE_URL}/repositories/{repo_path}/pipelines/{pipeline_uuid}/steps/{{{step_uuid}}}/log",
-                            headers=headers,
                         )
                         if log_resp.status_code == 200:
                             trace_text = log_resp.text
@@ -230,19 +205,12 @@ class BitbucketAPIClient:
         """
         print(f"[DEBUG] create_branch called | project_id={project_id} | source_branch={source_branch} | new_branch_name={new_branch_name}")
 
-        headers = await self._get_auth_headers(project_id)
-        if not headers:
-            return None
-
-        project_config = await self.mongo_service.get_project_by_id(project_id)
-        repo_path = self._get_project_repo_path(project_config)
+        repo_path = await self._get_repo_path(project_id)
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                headers["Content-Type"] = "application/json"
+            async with httpx.AsyncClient(timeout=15.0, auth=self._auth) as client:
                 resp = await client.post(
                     f"{self.BASE_URL}/repositories/{repo_path}/refs/branches",
-                    headers=headers,
                     json={
                         "name": new_branch_name,
                         "target": {
@@ -291,26 +259,18 @@ class BitbucketAPIClient:
         """
         print(f"[DEBUG] update_file called | project_id={project_id} | branch={branch} | file_path={file_path}")
 
-        headers = await self._get_auth_headers(project_id)
-        if not headers:
-            return None
+        repo_path = await self._get_repo_path(project_id)
 
-        project_config = await self.mongo_service.get_project_by_id(project_id)
-        repo_path = self._get_project_repo_path(project_config)
-
-        # Get author info
-        author_name = project_config.get("author_name", "Axolotl Agent")
-        author_email = project_config.get("author_email", "agent@axolotl.local")
+        # Get author info from env
+        author_name = os.getenv("AUTHOR_NAME", "Axolotl Agent")
+        author_email = os.getenv("AUTHOR_EMAIL", "agent@axolotl.local")
         print(f"[DEBUG] Author configured: {author_name} <{author_email}>")
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, auth=self._auth) as client:
                 # Bitbucket uses form-encoded POST to /src for file commits
-                # Do NOT set Content-Type in headers — httpx will set multipart boundary
-                auth_headers = {"Authorization": headers["Authorization"]}
                 resp = await client.post(
                     f"{self.BASE_URL}/repositories/{repo_path}/src",
-                    headers=auth_headers,
                     data={
                         file_path: content,
                         "message": commit_message,
@@ -357,19 +317,12 @@ class BitbucketAPIClient:
         """
         print(f"[DEBUG] create_pull_request called | project_id={project_id} | source_branch={source_branch} | target_branch={target_branch}")
 
-        headers = await self._get_auth_headers(project_id)
-        if not headers:
-            return None
-
-        project_config = await self.mongo_service.get_project_by_id(project_id)
-        repo_path = self._get_project_repo_path(project_config)
+        repo_path = await self._get_repo_path(project_id)
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                headers["Content-Type"] = "application/json"
+            async with httpx.AsyncClient(timeout=15.0, auth=self._auth) as client:
                 resp = await client.post(
                     f"{self.BASE_URL}/repositories/{repo_path}/pullrequests",
-                    headers=headers,
                     json={
                         "title": title,
                         "description": description,

@@ -52,13 +52,31 @@ class MongoDBService:
         print("Created indexes for projects collection")
 
         users_collection = self.db["users"]
+
+        # Handle legacy gitlab_user_id index: may exist as non-sparse.
+        # Drop and recreate as sparse to allow Bitbucket users (who lack this field).
+        try:
+            existing_indexes = await users_collection.index_information()
+            if "gitlab_user_id_1" in existing_indexes:
+                old_idx = existing_indexes["gitlab_user_id_1"]
+                if not old_idx.get("sparse", False):
+                    print("[INDEX] Dropping old non-sparse gitlab_user_id index...")
+                    await users_collection.drop_index("gitlab_user_id_1")
+        except Exception as e:
+            print(f"[INDEX] Warning checking existing indexes: {e}")
+
         await users_collection.create_index("gitlab_user_id", unique=True, sparse=True)
+
         # Multi-provider index: (provider, provider_user_id)
-        await users_collection.create_index(
-            [("provider", 1), ("provider_user_id", 1)],
-            unique=True,
-            sparse=True,
-        )
+        try:
+            await users_collection.create_index(
+                [("provider", 1), ("provider_user_id", 1)],
+                unique=True,
+                sparse=True,
+            )
+        except Exception as e:
+            print(f"[INDEX] Warning creating compound index (may already exist): {e}")
+
         print("Created indexes for users collection")
 
         # ── Startup migration: backfill 'provider' on legacy documents ──

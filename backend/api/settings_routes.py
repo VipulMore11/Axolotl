@@ -112,7 +112,7 @@ async def list_gitlab_repos(
     return {"repos": repos, "total": len(repos)}
 
 
-# ── Bitbucket Repos (Browse user's repositories) ───────────────────
+# ── Bitbucket Repos (Browse repositories — POC with App Password) ──
 
 @router.get("/bitbucket-repos")
 async def list_bitbucket_repos(
@@ -122,21 +122,23 @@ async def list_bitbucket_repos(
     page: int = 1,
 ):
     """
-    List Bitbucket repositories the user has access to.
-    Returns repos with key metadata for the project selector UI.
+    List Bitbucket repositories accessible via the App Password.
+    POC mode: uses BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD from .env.
     """
-    mongo = get_mongo_service()
-    user_doc = await mongo.get_user_by_id(user.id)
-    if not user_doc or not user_doc.get("access_token"):
-        raise HTTPException(status_code=401, detail="Bitbucket token not found. Please re-login.")
+    bb_username = os.getenv("BITBUCKET_USERNAME", "")
+    bb_app_password = os.getenv("BITBUCKET_APP_PASSWORD", "")
+    bb_workspace = os.getenv("BITBUCKET_WORKSPACE", "")
 
-    bb_token = user_doc["access_token"]
+    if not bb_username or not bb_app_password:
+        raise HTTPException(
+            status_code=400,
+            detail="BITBUCKET_USERNAME and BITBUCKET_APP_PASSWORD must be set in .env",
+        )
+
     base_url = "https://api.bitbucket.org/2.0"
 
-    # Get user's workspaces first, then repos
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            # Fetch repos the user has access to
+        async with httpx.AsyncClient(timeout=15.0, auth=(bb_username, bb_app_password)) as client:
             params = {
                 "role": "member",
                 "pagelen": per_page,
@@ -146,11 +148,13 @@ async def list_bitbucket_repos(
             if search:
                 params["q"] = f'name ~ "{search}"'
 
-            resp = await client.get(
-                f"{base_url}/repositories",
-                headers={"Authorization": f"Bearer {bb_token}"},
-                params=params,
-            )
+            # If workspace is set, list repos for that workspace; otherwise list all
+            if bb_workspace:
+                url = f"{base_url}/repositories/{bb_workspace}"
+            else:
+                url = f"{base_url}/repositories"
+
+            resp = await client.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()
             repositories = data.get("values", [])
@@ -162,6 +166,7 @@ async def list_bitbucket_repos(
         raise HTTPException(status_code=502, detail="Failed to fetch repositories from Bitbucket")
 
     # Get list of already-watched project IDs
+    mongo = get_mongo_service()
     watched = await mongo.get_projects_for_user(user.id)
     watched_ids = {str(p.get("project_id")) for p in watched}
 
