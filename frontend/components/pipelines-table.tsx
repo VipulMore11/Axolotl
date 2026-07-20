@@ -51,11 +51,10 @@ export function PipelinesTable({ pipelines }: PipelinesTableProps) {
           <button
             key={f.value}
             onClick={() => setFilter(f.value)}
-            className={`rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${
-              filter === f.value
+            className={`rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${filter === f.value
                 ? "border-primary/40 bg-primary/15 text-primary"
                 : "border-border bg-card text-muted-foreground hover:border-border hover:bg-secondary hover:text-foreground"
-            }`}
+              }`}
           >
             {f.label}
           </button>
@@ -67,12 +66,13 @@ export function PipelinesTable({ pipelines }: PipelinesTableProps) {
 
       {/* table */}
       <div className="overflow-hidden rounded-lg border border-border bg-card">
-        <div className="hidden grid-cols-[110px_1fr_160px_120px_110px] gap-4 border-b border-border bg-secondary/40 px-4 py-2.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground md:grid">
-          <span>Pipeline</span>
-          <span>Commit</span>
+        <div className="hidden grid-cols-[90px_120px_2fr_1fr_120px_100px] gap-4 border-b border-border bg-secondary/40 px-4 py-2.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground md:grid">
+          <span className="text-center">Time</span>
+          <span className="text-center">Pipeline</span>
+          <span className="text-left md:pl-6">Commit</span>
           <span>Branch</span>
-          <span>Status</span>
-          <span className="text-right">Duration</span>
+          <span className="text-center">Status</span>
+          <span className="text-center">Duration</span>
         </div>
         {rows.length === 0 ? (
           <div className="flex items-center justify-center px-4 py-12 text-sm text-muted-foreground">
@@ -84,13 +84,17 @@ export function PipelinesTable({ pipelines }: PipelinesTableProps) {
               <li key={`${p.project_id}-${p.id}`}>
                 <Link
                   href="/"
-                  className="grid grid-cols-1 gap-2 border-b border-border/60 px-4 py-3.5 transition-colors last:border-0 hover:bg-secondary/40 md:grid-cols-[110px_1fr_160px_120px_110px] md:items-center md:gap-4"
+                  className="grid grid-cols-1 gap-2 border-b border-border/60 px-4 py-3.5 transition-colors last:border-0 hover:bg-secondary/40 md:grid-cols-[90px_120px_2fr_1fr_120px_100px] md:items-center md:gap-4"
                 >
-                  <div className="flex items-center gap-2 font-mono text-sm text-foreground">
+                  <div className="flex items-center md:justify-center gap-1.5 font-mono text-xs text-muted-foreground">
+                    <Clock className="size-3.5 md:hidden" />
+                    <span>{formatTime(p.created_at)}</span>
+                  </div>
+                  <div className="flex items-center md:justify-center gap-2 font-mono text-sm text-foreground">
                     {p.agent_engaged && <AxolotlMark className="size-4 shrink-0" />}
                     #{p.id}
                   </div>
-                  <div className="min-w-0">
+                  <div className="min-w-0 md:pl-6">
                     <div className="flex items-center gap-1.5 text-sm text-foreground">
                       <GitCommit className="size-3.5 shrink-0 text-accent" />
                       <span className="truncate">{p.sha}</span>
@@ -98,17 +102,17 @@ export function PipelinesTable({ pipelines }: PipelinesTableProps) {
                     <div className="mt-0.5 flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
                       <span className="text-accent/70">{p.sha}</span>
                       <span className="text-muted-foreground/40">·</span>
-                      <span>{p.project_name}</span>
+                      <span className="truncate">{p.project_name}</span>
                     </div>
                   </div>
-                  <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
+                  <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground min-w-0">
                     <GitBranch className="size-3.5 shrink-0" />
                     <span className="truncate">{p.ref}</span>
                   </div>
-                  <div>
+                  <div className="flex md:justify-center">
                     <StatusBadge status={p.status as PipelineStatus} />
                   </div>
-                  <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground md:justify-end">
+                  <div className="flex items-center md:justify-center gap-1.5 font-mono text-xs text-muted-foreground">
                     <Clock className="size-3.5 md:hidden" />
                     {formatDuration(p.duration)}
                   </div>

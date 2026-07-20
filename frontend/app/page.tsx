@@ -195,7 +195,7 @@ export default function Page() {
             {/* right: panels */}
             <div className="flex flex-col gap-4">
               {/* terminal + logs row */}
-              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <div className="flex flex-col gap-4">
                 <div className="h-[340px]">
                   <TerminalUI wsEvents={wsEvents} isConnected={isConnected} />
                 </div>

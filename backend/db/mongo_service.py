@@ -52,8 +52,17 @@ class MongoDBService:
         print("Created indexes for projects collection")
 
         users_collection = self.db["users"]
-        await users_collection.create_index("gitlab_user_id", unique=True)
+        await users_collection.create_index("gitlab_user_id", unique=True, sparse=True)
+        # Multi-provider index: (provider, provider_user_id)
+        await users_collection.create_index(
+            [("provider", 1), ("provider_user_id", 1)],
+            unique=True,
+            sparse=True,
+        )
         print("Created indexes for users collection")
+
+        # ── Startup migration: backfill 'provider' on legacy documents ──
+        await self._migrate_provider_fields()
 
     # ============ Projects Collection Operations ============
 
@@ -187,11 +196,28 @@ class MongoDBService:
     # ============ Users Collection Operations ============
 
     async def upsert_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Upsert a user by gitlab_user_id. Returns the full document."""
+        """Upsert a user by provider identity. Returns the full document.
+
+        For GitLab users: matches on gitlab_user_id (backwards compat).
+        For Bitbucket users: matches on (provider, provider_user_id).
+        """
         users = self.db["users"]
         now = datetime.now(UTC)
+
+        provider = user_data.get("provider", "gitlab")
+
+        if provider == "gitlab" and "gitlab_user_id" in user_data:
+            # GitLab: match on legacy field for backwards compat
+            query = {"gitlab_user_id": user_data["gitlab_user_id"]}
+        else:
+            # Bitbucket (or any future provider): match on provider + provider_user_id
+            query = {
+                "provider": provider,
+                "provider_user_id": user_data.get("provider_user_id", ""),
+            }
+
         result = await users.find_one_and_update(
-            {"gitlab_user_id": user_data["gitlab_user_id"]},
+            query,
             {
                 "$set": {**user_data, "updated_at": now},
                 "$setOnInsert": {"created_at": now},
@@ -329,6 +355,36 @@ class MongoDBService:
             project["_id"] = str(project["_id"])
             results.append(project)
         return results
+
+    # ============ Migration Operations ============
+
+    async def _migrate_provider_fields(self):
+        """Backfill 'provider' field on legacy documents missing it."""
+        # Backfill projects
+        projects = self.db["projects"]
+        result = await projects.update_many(
+            {"provider": {"$exists": False}},
+            {"$set": {"provider": "gitlab"}},
+        )
+        if result.modified_count > 0:
+            print(f"[MIGRATION] Backfilled 'provider=gitlab' on {result.modified_count} project(s)")
+
+        # Backfill users
+        users = self.db["users"]
+        result = await users.update_many(
+            {"provider": {"$exists": False}},
+            {"$set": {"provider": "gitlab"}},
+        )
+        if result.modified_count > 0:
+            print(f"[MIGRATION] Backfilled 'provider=gitlab' on {result.modified_count} user(s)")
+
+        # Backfill provider_user_id from gitlab_user_id where missing
+        async for user in users.find({"provider_user_id": {"$exists": False}, "gitlab_user_id": {"$exists": True}}):
+            await users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"provider_user_id": str(user["gitlab_user_id"])}},
+            )
+        print("[MIGRATION] Provider field migration complete")
 
     @asynccontextmanager
     async def get_connection(self):

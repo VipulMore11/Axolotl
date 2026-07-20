@@ -104,20 +104,20 @@ export function TerminalUI({ wsEvents = [], isConnected = false }: TerminalUIPro
       <div ref={scrollRef} className="flex-1 overflow-auto px-4 py-3 font-mono text-xs leading-relaxed">
         {/* Boot line */}
         <div className="flex gap-2">
-          <span className={`whitespace-pre-wrap ${lineColor[bootLine.type]}`}>{bootLine.text}</span>
+          <span className={`whitespace-pre-wrap break-words min-w-0 ${lineColor[bootLine.type]}`}>{bootLine.text}</span>
         </div>
         {/* WS events */}
         {wsLines.map((line, i) => (
           <div key={`ws-${i}`} className="flex gap-2">
             <span className="shrink-0 text-accent">▸</span>
-            <span className={`whitespace-pre-wrap ${lineColor[line.type]}`}>{line.text}</span>
+            <span className={`whitespace-pre-wrap break-words min-w-0 ${lineColor[line.type]}`}>{line.text}</span>
           </div>
         ))}
         {/* User command history */}
         {history.filter(Boolean).map((line, i) => (
           <div key={`h-${i}`} className="flex gap-2">
             {line.type === "prompt" && <span className="shrink-0 text-primary">$</span>}
-            <span className={`whitespace-pre-wrap ${lineColor[line.type]}`}>{line.text}</span>
+            <span className={`whitespace-pre-wrap break-words min-w-0 ${lineColor[line.type]}`}>{line.text}</span>
           </div>
         ))}
       </div>

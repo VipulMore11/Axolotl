@@ -133,6 +133,7 @@ class PipelineOrchestrator:
         pipeline_id: str,
         branch: str,
         user_id: Optional[str] = None,
+        provider: str = "gitlab",
     ) -> dict:
         """
         Run the complete pipeline fix workflow using MCP tools.
@@ -159,7 +160,7 @@ class PipelineOrchestrator:
         session_id = f"pipeline-{pipeline_id}"
         fix_branch = f"axolotl/fix/{pipeline_id}"
 
-        print(f"[DEBUG] handle_pipeline_failure called | project_id={project_id} | pipeline_id={pipeline_id} | branch={branch}")
+        print(f"[DEBUG] handle_pipeline_failure called | project_id={project_id} | pipeline_id={pipeline_id} | branch={branch} | provider={provider}")
 
         await self._publish_event(
             EventType.PIPELINE_FAILED,
@@ -174,11 +175,19 @@ class PipelineOrchestrator:
         # Determine project root (where .env and packages live)
         project_root = str(pathlib.Path(__file__).resolve().parent.parent)
 
-        # Connect to GitLab MCP Server via stdio
+        # Connect to the correct MCP Server based on provider
+        # Both servers expose identical tool names so the rest of the workflow is unchanged.
+        if provider == "bitbucket":
+            mcp_module = "bitbucket_client.mcp_server"
+        else:
+            mcp_module = "gitlab_client.mcp_server"
+
+        print(f"[DEBUG] Using MCP module: {mcp_module}")
+
         # Pass the full environment so the subprocess inherits MONGODB_CONNECTION_STRING etc.
         server_params = StdioServerParameters(
             command=python_exe,
-            args=["-m", "gitlab_client.mcp_server"],
+            args=["-m", mcp_module],
             cwd=project_root,
             env={**os.environ},
         )

@@ -24,6 +24,9 @@ class AddProjectRequest(BaseModel):
     project_id: str
     gitlab_url: str = "https://gitlab.com"
     auto_fix: bool = True
+    provider: str = "gitlab"  # "gitlab" or "bitbucket"
+    workspace: str = ""  # Bitbucket workspace slug
+    repo_slug: str = ""  # Bitbucket repository slug
 
 
 class UpdateProjectRequest(BaseModel):
@@ -109,6 +112,87 @@ async def list_gitlab_repos(
     return {"repos": repos, "total": len(repos)}
 
 
+# ── Bitbucket Repos (Browse user's repositories) ───────────────────
+
+@router.get("/bitbucket-repos")
+async def list_bitbucket_repos(
+    user: UserResponse = Depends(get_current_user),
+    search: str = "",
+    per_page: int = 20,
+    page: int = 1,
+):
+    """
+    List Bitbucket repositories the user has access to.
+    Returns repos with key metadata for the project selector UI.
+    """
+    mongo = get_mongo_service()
+    user_doc = await mongo.get_user_by_id(user.id)
+    if not user_doc or not user_doc.get("access_token"):
+        raise HTTPException(status_code=401, detail="Bitbucket token not found. Please re-login.")
+
+    bb_token = user_doc["access_token"]
+    base_url = "https://api.bitbucket.org/2.0"
+
+    # Get user's workspaces first, then repos
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Fetch repos the user has access to
+            params = {
+                "role": "member",
+                "pagelen": per_page,
+                "page": page,
+                "sort": "-updated_on",
+            }
+            if search:
+                params["q"] = f'name ~ "{search}"'
+
+            resp = await client.get(
+                f"{base_url}/repositories",
+                headers={"Authorization": f"Bearer {bb_token}"},
+                params=params,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            repositories = data.get("values", [])
+    except httpx.HTTPStatusError as e:
+        print(f"[SETTINGS] Bitbucket API error: {e}")
+        raise HTTPException(status_code=502, detail=f"Bitbucket API error: {e.response.status_code}")
+    except Exception as e:
+        print(f"[SETTINGS] Error fetching Bitbucket repos: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch repositories from Bitbucket")
+
+    # Get list of already-watched project IDs
+    watched = await mongo.get_projects_for_user(user.id)
+    watched_ids = {str(p.get("project_id")) for p in watched}
+
+    repos = []
+    for r in repositories:
+        full_name = r.get("full_name", "")
+        workspace_slug = full_name.split("/")[0] if "/" in full_name else ""
+        repo_slug = r.get("slug", "")
+        avatar_url = r.get("links", {}).get("avatar", {}).get("href")
+
+        repos.append({
+            "id": full_name,  # Use full_name as ID for Bitbucket
+            "name": r.get("name", ""),
+            "path_with_namespace": full_name,
+            "description": r.get("description") or "",
+            "web_url": r.get("links", {}).get("html", {}).get("href", ""),
+            "default_branch": r.get("mainbranch", {}).get("name", "main") if r.get("mainbranch") else "main",
+            "avatar_url": avatar_url,
+            "last_activity_at": r.get("updated_on", ""),
+            "visibility": "private" if r.get("is_private") else "public",
+            "star_count": 0,  # Bitbucket doesn't have stars
+            "forks_count": 0,
+            "already_connected": full_name in watched_ids,
+            "provider": "bitbucket",
+            "workspace": workspace_slug,
+            "repo_slug": repo_slug,
+        })
+
+    return {"repos": repos, "total": len(repos)}
+
+
 # ── Projects ────────────────────────────────────────────────────────
 
 @router.get("/projects")
@@ -129,6 +213,9 @@ async def list_watched_projects(
             "auto_fix": p.get("auto_fix", True),
             "webhook_registered": p.get("webhook_registered", False),
             "webhook_id": p.get("webhook_id"),
+            "provider": p.get("provider", "gitlab"),
+            "workspace": p.get("workspace", ""),
+            "repo_slug": p.get("repo_slug", ""),
         })
 
     return {"projects": result}
@@ -234,6 +321,9 @@ async def add_watched_project(
         "branch": default_branch,
         "webhook_registered": webhook_registered,
         "webhook_id": webhook_id,
+        "provider": body.provider,
+        "workspace": body.workspace,
+        "repo_slug": body.repo_slug,
     }
 
     doc_id = await mongo.add_project(project_data)
@@ -341,21 +431,25 @@ async def update_agent_settings(
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
-def _get_webhook_url() -> str:
+def _get_webhook_url(provider: str = "gitlab") -> str:
     """
-    Build the webhook URL Axolotl registers on GitLab projects.
-    Uses GITLAB_REDIRECT_URI to detect the public ngrok/production base URL,
-    since that's the same tunnel the OAuth callback uses.
+    Build the webhook URL Axolotl registers on projects.
+    Uses GITLAB_REDIRECT_URI or BITBUCKET_REDIRECT_URI to detect the public base URL.
     """
-    redirect_uri = os.getenv("GITLAB_REDIRECT_URI", "")
+    if provider == "bitbucket":
+        redirect_uri = os.getenv("BITBUCKET_REDIRECT_URI", "")
+        webhook_path = "/webhooks/bitbucket/pipeline"
+    else:
+        redirect_uri = os.getenv("GITLAB_REDIRECT_URI", "")
+        webhook_path = "/webhooks/gitlab/pipeline"
+
     if redirect_uri:
-        # Extract base URL from redirect URI (e.g. https://xxx.ngrok-free.dev/auth/gitlab/callback → https://xxx.ngrok-free.dev)
         from urllib.parse import urlparse
         parsed = urlparse(redirect_uri)
         base = f"{parsed.scheme}://{parsed.netloc}"
-        return f"{base}/webhooks/gitlab/pipeline"
+        return f"{base}{webhook_path}"
 
     # Fallback
     host = os.getenv("WEBHOOK_SERVER_HOST", "0.0.0.0")
     port = os.getenv("WEBHOOK_SERVER_PORT", "8000")
-    return f"http://{host}:{port}/webhooks/gitlab/pipeline"
+    return f"http://{host}:{port}{webhook_path}"

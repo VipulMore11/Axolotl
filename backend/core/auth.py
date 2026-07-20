@@ -115,7 +115,9 @@ async def get_current_user(
 
     return UserResponse(
         id=str(user_doc["_id"]),
-        gitlab_user_id=user_doc["gitlab_user_id"],
+        provider=user_doc.get("provider", "gitlab"),
+        gitlab_user_id=user_doc.get("gitlab_user_id"),
+        provider_user_id=user_doc.get("provider_user_id", str(user_doc.get("gitlab_user_id", ""))),
         username=user_doc["username"],
         name=user_doc["name"],
         avatar_url=user_doc.get("avatar_url"),

@@ -45,32 +45,32 @@ export function LogPanel({ title, subtitle, logs, accent }: LogPanelProps) {
 
       {/* log body */}
       <div className="flex-1 overflow-auto">
-        <table className="w-full border-collapse font-mono text-xs">
+        <table className="w-full border-collapse font-mono text-xs table-fixed">
           <tbody>
             {logs.map((line, i) => (
               <tr
                 key={i}
                 className="group align-top transition-colors hover:bg-secondary/40"
               >
-                <td className="select-none border-r border-border/60 px-3 py-0.5 text-right text-muted-foreground/40 tabular-nums">
+                <td className="w-10 select-none border-r border-border/60 px-3 py-0.5 text-right text-muted-foreground/40 tabular-nums">
                   {i + 1}
                 </td>
-                <td className="select-none whitespace-nowrap px-2.5 py-0.5 text-muted-foreground/60">
+                <td className="w-20 select-none whitespace-nowrap px-2.5 py-0.5 text-muted-foreground/60">
                   {line.ts}
                 </td>
-                <td className={`select-none px-1 py-0.5 font-semibold ${levelStyles[line.level]}`}>
+                <td className={`w-12 select-none px-1 py-0.5 font-semibold ${levelStyles[line.level]}`}>
                   {levelLabel[line.level]}
                 </td>
-                <td className="whitespace-nowrap px-2 py-0.5 text-accent/70">
+                <td className="w-[120px] whitespace-nowrap px-2 py-0.5 text-accent/70 truncate">
                   {line.source}
                 </td>
-                <td className={`w-full px-2 py-0.5 ${levelStyles[line.level]}`}>
+                <td className={`w-full px-2 py-0.5 break-words ${levelStyles[line.level]}`}>
                   {line.message}
                 </td>
               </tr>
             ))}
             <tr>
-              <td className="border-r border-border/60 px-3 py-0.5 text-right text-muted-foreground/40">
+              <td className="w-10 border-r border-border/60 px-3 py-0.5 text-right text-muted-foreground/40">
                 {logs.length + 1}
               </td>
               <td colSpan={4} className="px-2.5 py-0.5">
