@@ -230,12 +230,34 @@ class PipelineOrchestrator:
                     for job in logs_result["failed_jobs"]
                 )
 
-                # ── Step 2: Analyze with AI Agent ───────────────────
-                await self._publish_event(
-                    EventType.ANALYZING,
-                    "Analyzing root cause with AI agent...",
-                    session_id=session_id,
-                )
+                # ── Step 2: Eight-stage LangGraph CI fix agent ──────
+                stage_event_map = {
+                    "workspace_setup": EventType.WORKSPACE_SETUP,
+                    "requirements_analysis": EventType.REQUIREMENTS_ANALYSIS,
+                    "technical_architecture": EventType.TECHNICAL_ARCHITECTURE,
+                    "task_breakdown": EventType.TASK_BREAKDOWN,
+                    "code_implementation": EventType.CODE_IMPLEMENTATION,
+                    "testing_validation": EventType.TESTING_VALIDATION,
+                    "code_review": EventType.CODE_REVIEW,
+                }
+
+                async def on_stage(
+                    stage: str,
+                    message: str,
+                    metadata: Optional[dict] = None,
+                ) -> None:
+                    event_type = stage_event_map.get(stage)
+                    if event_type is None:
+                        return
+                    await self._publish_event(
+                        event_type,
+                        message,
+                        session_id=session_id,
+                        metadata=metadata,
+                    )
+
+                if hasattr(self.ci_fix_agent, "set_on_stage"):
+                    self.ci_fix_agent.set_on_stage(on_stage)
 
                 failure = PipelineFailure(
                     project_id=project_id,
@@ -256,13 +278,9 @@ class PipelineOrchestrator:
                         session_id=session_id,
                     )
                     return {"status": "failed", "reason": str(e)}
-
-                await self._publish_event(
-                    EventType.GENERATING_FIX,
-                    f"Root cause: {fix.root_cause}. Fix target: {fix.file_path}",
-                    session_id=session_id,
-                    metadata={"root_cause": fix.root_cause, "file_path": fix.file_path},
-                )
+                finally:
+                    if hasattr(self.ci_fix_agent, "set_on_stage"):
+                        self.ci_fix_agent.set_on_stage(None)
 
                 # Log the agent trace for observability
                 if self.event_publisher and self.event_publisher.observability:
@@ -274,11 +292,12 @@ class PipelineOrchestrator:
                     )
                     await self.event_publisher.observability.create_trace(trace)
 
-                # ── Step 3: Create fix branch ───────────────────────
+                # ── Step 3–5: Git Operations (MCP branch / commit / MR) ─
                 await self._publish_event(
-                    EventType.CREATING_BRANCH,
-                    f"Creating branch '{fix_branch}' from '{branch}'...",
+                    EventType.GIT_OPERATIONS,
+                    f"Git operations: creating branch '{fix_branch}' from '{branch}'...",
                     session_id=session_id,
+                    metadata={"step": "create_branch", "fix_branch": fix_branch},
                 )
 
                 branch_result = await self._call_mcp_tool(session, "create_branch", {
@@ -296,11 +315,11 @@ class PipelineOrchestrator:
                     )
                     return {"status": "failed", "reason": "branch_creation_failed"}
 
-                # ── Step 4: Commit the fix ──────────────────────────
                 await self._publish_event(
-                    EventType.COMMITTING,
-                    f"Committing fix to {fix.file_path}...",
+                    EventType.GIT_OPERATIONS,
+                    f"Git operations: committing fix to {fix.file_path}...",
                     session_id=session_id,
+                    metadata={"step": "commit", "file_path": fix.file_path},
                 )
 
                 update_result = await self._call_mcp_tool(session, "update_file", {
@@ -320,11 +339,11 @@ class PipelineOrchestrator:
                     )
                     return {"status": "failed", "reason": "commit_failed"}
 
-                # ── Step 5: Create merge request ────────────────────
                 await self._publish_event(
-                    EventType.CREATING_MR,
-                    "Creating merge request...",
+                    EventType.GIT_OPERATIONS,
+                    "Git operations: creating merge request...",
                     session_id=session_id,
+                    metadata={"step": "create_mr"},
                 )
 
                 mr_description = (
@@ -355,7 +374,7 @@ class PipelineOrchestrator:
                     )
                     return {"status": "failed", "reason": "mr_creation_failed"}
 
-                # ── Step 6: Success ─────────────────────────────────
+                # ── Step 6: Human Approval ──────────────────────────
                 await self._publish_event(
                     EventType.WAITING_APPROVAL,
                     f"Merge request created! Awaiting human approval. URL: {mr_result.get('web_url', 'N/A')}",

@@ -38,6 +38,9 @@ async def lifespan(app: FastAPI):
     Connects to MongoDB on startup, disconnects on shutdown.
     """
     # ── Startup ──
+    from agents.langsmith_tracing import configure_langsmith
+
+    configure_langsmith()
     mongo = get_mongo_service()
     await mongo.connect()
     print("Axolotl backend started.")

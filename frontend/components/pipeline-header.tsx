@@ -47,7 +47,12 @@ export function PipelineHeader({ sessionId, events, isConnected }: PipelineHeade
 
   // Extract info from events
   const pipelineEvent = events.find((e) => e.event_type === "pipeline_failed")
-  const analyzeEvent = events.find((e) => e.event_type === "generating_fix")
+  const analyzeEvent = events.find(
+    (e) =>
+      e.event_type === "code_implementation" ||
+      e.event_type === "requirements_analysis" ||
+      e.event_type === "generating_fix"
+  )
   const isComplete = events.some((e) => e.event_type === "waiting_approval" || e.event_type === "fix_succeeded")
 
   const stats = [

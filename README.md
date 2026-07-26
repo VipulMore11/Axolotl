@@ -52,9 +52,8 @@ flowchart TD
     F --> G[📥 MCP: get_pipeline_logs\nFetch failed job traces]
     G --> H{Logs\nFound?}
     H -- No --> Z1([❌ Fix Failed: no logs])
-    H -- Yes --> I[🧠 CIFixAgent.analyze\nGemini 2.5 Flash]
-
-    I --> J[📝 FixProposal\nroot_cause · file_path\nupdated_content · commit_message]
+    H -- Yes --> I[LangGraph 8-stage CI fix\nworkspace → review]
+    I --> J[FixProposal\nroot_cause · file_path\nupdated_content · commit_message]
 
     J --> K[🌿 MCP: create_branch\naxolotl/fix/<pipeline_id>]
     K --> L{Branch\nCreated?}
@@ -189,8 +188,10 @@ sequenceDiagram
 | Layer | Technology |
 |---|---|
 | Framework | [FastAPI](https://fastapi.tiangolo.com) 0.115 + Uvicorn |
-| AI / LLM | [Google Gemini 2.5 Flash](https://ai.google.dev) via `google-genai` SDK |
-| Agent Framework | [Google ADK](https://google.github.io/adk-docs/) |
+| AI / LLM | [Google Gemini 2.5 Flash](https://ai.google.dev) via LangChain (`langchain-google-genai`) |
+| Agent Framework | [LangGraph](https://langchain-ai.github.io/langgraph/) eight-stage Evaluator-Optimizer loop with artifact contracts (Flash for analysis/tasks; Pro for architect/dev/review) |
+| Agent Observability | [LangSmith](https://smith.langchain.com) tracing (set `LANGSMITH_TRACING=true`) |
+| Fix Validation | Local Docker sandbox (`axolotl-validator`) — allowlisted pip/ruff/py_compile checks |
 | MCP Transport | [Model Context Protocol (MCP)](https://modelcontextprotocol.io) — stdio client/server |
 | Database | MongoDB (Motor async driver) |
 | HTTP Client | httpx (async) |
@@ -229,6 +230,7 @@ Before running Axolotl, make sure you have:
 - **MongoDB** — local or [Atlas](https://cloud.mongodb.com) cluster
 - **GitLab account** with a project you own (Developer access or above)
 - **Google Gemini API key** — get one at [Google AI Studio](https://aistudio.google.com)
+- **Docker** (recommended) — for local patch validation via the `axolotl-validator` image
 - **ngrok** (for local development, to expose your webhook endpoint publicly)
 - **GitLab OAuth Application** — configured in *GitLab → Preferences → Applications*
 
@@ -258,6 +260,9 @@ source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Build the CI fix validator image (required when CI_FIX_VALIDATE=true)
+docker build -t axolotl-validator -f sandbox/Dockerfile sandbox
 ```
 
 #### Configure environment variables
@@ -268,6 +273,22 @@ Create a `.env` file inside `backend/` and fill in your values:
 # ── Gemini AI ──────────────────────────────────────────────
 GEMINI_API_KEY=your_gemini_api_key_here
 GEMINI_MODEL=gemini-2.5-flash
+# Persona model split (artifact-contract pipeline)
+GEMINI_FLASH_MODEL=gemini-2.5-flash
+GEMINI_PRO_MODEL=gemini-2.5-pro
+
+# ── CI Fix Engine (LangGraph default) ─────────────────────
+CI_FIX_ENGINE=langgraph
+CI_FIX_VALIDATE=true
+CI_FIX_MAX_ATTEMPTS=3
+# CI_FIX_VALIDATOR_IMAGE=axolotl-validator
+# Set CI_FIX_VALIDATE=false on hosts without Docker (e.g. some PaaS)
+
+# ── LangSmith (optional tracing for LangGraph runs) ───────
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=your_langsmith_api_key_here
+LANGSMITH_PROJECT=axolotl-ci-fix
+# LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 
 # ── MongoDB ────────────────────────────────────────────────
 MONGODB_CONNECTION_STRING=mongodb+srv://user:pass@cluster.mongodb.net/axolotl
@@ -342,11 +363,36 @@ docker run -p 8000:8000 --env-file backend/.env axolotl-backend
 
 ### Triggering the Agent (Automatic)
 
-Simply push a commit with a CI failure to any watched GitLab project. Axolotl will automatically:
-1. Receive the pipeline webhook
-2. Analyze the failure with Gemini
-3. Commit a fix to a new branch
-4. Open a Merge Request for your review
+Simply push a commit with a CI failure to any watched GitLab (or Bitbucket) project. Axolotl will automatically:
+1. Receive the pipeline webhook and fetch logs via MCP
+2. Run the eight-stage LangGraph agent with artifact contracts (workspace → requirements → architecture → tasks → implement → validate → review). Analyst/Tech Lead use Gemini Flash; Architect/Developer/Evaluator use Gemini Pro.
+3. Apply Git Operations via MCP (branch, commit, merge request)
+4. Wait for human approval on the MR
+
+### Personal-repo demo (no company admin access)
+
+If you cannot register webhooks on a company repo, use a **personal** GitLab/Bitbucket project:
+
+1. Create a small Python repo with an intentional failure (e.g. missing dependency in `requirements.txt`).
+2. Build the validator: `docker build -t axolotl-validator -f backend/sandbox/Dockerfile backend/sandbox`
+3. Run Axolotl locally, expose with ngrok, connect the personal project in Settings.
+4. Push the failing commit (or `curl` a Bitbucket `repo:commit_status_updated` payload to `/webhooks/bitbucket/pipeline`).
+5. Watch the dashboard: analyze → validate → MR → approve.
+
+Set `CI_FIX_ENGINE=legacy` only if you need the old one-shot Gemini path. Set `CI_FIX_VALIDATE=false` on hosts without Docker.
+
+### LangSmith traces
+
+With `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` set, every LangGraph CI-fix run appears in [smith.langchain.com](https://smith.langchain.com) under project `LANGSMITH_PROJECT` (default `axolotl-ci-fix`). You should see:
+
+- Parent run: `ci_fix_analyze` / `ci-fix-<pipeline_id>`
+- Graph nodes: `workspace_setup` → `requirements_analysis` → `technical_architecture` → `task_breakdown` → `code_implementation` → `testing_validation` → `code_review`
+- Artifacts in state: `ArchitecturePlan`, `task_breakdown[]`, `validation_failures[]`, `review_history[]` (`CritiqueResult`)
+- Child tool span: `docker_validate_patch`
+- Revise loops back to `code_implementation` with **targeted** edits when validation or review fails (up to `CI_FIX_MAX_ATTEMPTS`)
+- Metadata includes `flash_model` / `pro_model`
+
+Startup logs will print `[LangSmith] Tracing enabled → project=...` when configured correctly.
 
 ### Watching the Live Dashboard
 
@@ -621,11 +667,18 @@ axolotl/
 │   │
 │   ├── agents/                       # AI Agent layer
 │   │   ├── base_agent.py             # Abstract BaseAgent interface
-│   │   ├── ci_fix_agent.py           # CIFixAgent: Gemini-powered failure analysis
+│   │   ├── ci_fix_agent.py           # Facade: LangGraph (default) or legacy Gemini
+│   │   ├── langgraph_ci_fix_agent.py # 8-stage artifact contracts (Flash/Pro personas)
+│   │   ├── langsmith_tracing.py      # LangSmith env + run config helpers
+│   │   ├── sandbox_tools.py          # Ephemeral Docker validation helpers
+│   │   ├── ci_fix_state.py           # CIFixState + ArchitecturePlan/CritiqueResult
 │   │   └── prompt_builder.py         # Prompt engineering for CI logs
+│   ├── sandbox/                      # axolotl-validator Docker image
+│   │   ├── Dockerfile
+│   │   └── axolotl_validate.py
 │   │
 │   ├── orchestrator/                 # Workflow coordination
-│   │   ├── pipeline_orchestrator.py  # Core: full fix lifecycle (7-step workflow)
+│   │   ├── pipeline_orchestrator.py  # Core: full fix lifecycle (MCP + agent)
 │   │   └── event_types.py            # EventType enum
 │   │
 │   ├── gitlab_client/                # GitLab MCP Server

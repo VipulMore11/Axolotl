@@ -1,13 +1,14 @@
 export type PipelineStatus = "running" | "failed" | "fixing" | "awaiting-approval" | "passed"
 
 export type AgentStageKey =
-  | "detect"
-  | "fetch-logs"
-  | "analyze"
-  | "generate-fix"
-  | "branch"
-  | "commit"
-  | "merge-request"
+  | "workspace-setup"
+  | "requirements-analysis"
+  | "technical-architecture"
+  | "task-breakdown"
+  | "code-implementation"
+  | "testing-validation"
+  | "code-review"
+  | "git-operations"
   | "approval"
 
 export type StageState = "done" | "active" | "pending" | "error"
@@ -55,53 +56,60 @@ export const pipeline: Pipeline = {
 
 export const agentStages: AgentStage[] = [
   {
-    key: "detect",
-    label: "Detect Failure",
-    description: "Job `test:integration` exited with code 1",
-    state: "done",
-    durationMs: 1200,
-  },
-  {
-    key: "fetch-logs",
-    label: "Fetch Pipeline Logs",
-    description: "Pulled 4,812 lines across 3 failed jobs",
-    state: "done",
-    durationMs: 2400,
-  },
-  {
-    key: "analyze",
-    label: "Analyze Root Cause",
-    description: "Gemini 2.5 Pro — confidence 94%",
-    state: "done",
-    durationMs: 8600,
-  },
-  {
-    key: "generate-fix",
-    label: "Generate Fix",
-    description: "Patched `middleware/auth.ts` (+6 / -3)",
-    state: "done",
-    durationMs: 5100,
-  },
-  {
-    key: "branch",
-    label: "Create Branch",
-    description: "axolotl/fix-edge-auth-48291",
+    key: "workspace-setup",
+    label: "Workspace Setup",
+    description: "Sandbox workspace prepared for pipeline #48291",
     state: "done",
     durationMs: 800,
   },
   {
-    key: "commit",
-    label: "Commit Fix",
-    description: "b91e7d2 — fix: await async cookies() in edge auth",
+    key: "requirements-analysis",
+    label: "Requirements Analysis",
+    description: "Root cause: ModuleNotFound / CI failure from logs",
     state: "done",
-    durationMs: 1100,
+    durationMs: 4200,
   },
   {
-    key: "merge-request",
-    label: "Raise Merge Request",
-    description: "!1043 opened against `main`",
+    key: "technical-architecture",
+    label: "Technical Architecture",
+    description: "Strategy: single-file dependency / code patch",
     state: "done",
-    durationMs: 1500,
+    durationMs: 3100,
+  },
+  {
+    key: "task-breakdown",
+    label: "Task Breakdown",
+    description: "Edit target → validate → prepare commit",
+    state: "done",
+    durationMs: 1800,
+  },
+  {
+    key: "code-implementation",
+    label: "Code Implementation",
+    description: "Patched target file with AI-generated fix",
+    state: "done",
+    durationMs: 5100,
+  },
+  {
+    key: "testing-validation",
+    label: "Testing & Validation",
+    description: "Docker axolotl-validator — checks passed",
+    state: "done",
+    durationMs: 4100,
+  },
+  {
+    key: "code-review",
+    label: "Code Review",
+    description: "Self-review approved — patch addresses root cause",
+    state: "done",
+    durationMs: 2200,
+  },
+  {
+    key: "git-operations",
+    label: "Git Operations",
+    description: "Branch + commit + merge request via MCP",
+    state: "done",
+    durationMs: 3400,
   },
   {
     key: "approval",
