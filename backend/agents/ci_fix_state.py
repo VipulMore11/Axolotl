@@ -6,6 +6,21 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 
+class FilePatch(TypedDict):
+    """Single file edit within a multi-file FixProposal."""
+
+    file_path: str
+    updated_content: str
+
+
+class SearchReplaceBlock(TypedDict):
+    """Aider-style code-surgery block emitted by the Developer Agent."""
+
+    file_path: str
+    search_block: str  # must match the target file's exact formatting
+    replace_block: str
+
+
 class ArchitecturePlan(TypedDict):
     """Architect Agent output — low-blast-radius fix strategy."""
 
@@ -15,7 +30,7 @@ class ArchitecturePlan(TypedDict):
 
 
 class CritiqueResult(TypedDict):
-    """Evaluator Agent critique — must cite line numbers when rejecting."""
+    """Evaluator Agent critique — must cite line numbers and files when rejecting."""
 
     satisfactory: bool
     issues: list[str]
@@ -39,15 +54,19 @@ class CIFixState(TypedDict):
     branch: str
     logs: str
     root_cause: str
+    line_hints: dict[str, int]  # file_path -> failing line from the stack trace
     architecture_plan: ArchitecturePlan
     task_breakdown: list[str]
-    file_path: str
-    updated_content: str
+    file_contents: dict[str, str]  # original repo contents fetched for patching
+    search_replace_blocks: list[SearchReplaceBlock]
+    patch_failures: list[str]  # block-apply failures from the last implementation pass
+    file_patches: list[FilePatch]
     commit_message: str
     validation_output: str
     validation_passed: bool
     validation_failures: list[str]
     review_history: list[CritiqueResult]
     review_approved: bool
+    kb_grounding: str
     attempts: int
     current_stage: str

@@ -16,10 +16,11 @@ Analyze the following pipeline failure and return ONLY valid JSON with these exa
 - commit_message
 
 Use these MVP rules:
-1. If the logs mention ModuleNotFoundError, suggest updating requirements.txt.
-2. If the logs mention formatting, black, or ruff format, suggest running Black formatter.
-3. If the logs mention lint, flake8, or ruff, suggest applying a patch to the affected files.
-4. Keep the output concise and practical.
+1. If the logs mention ModuleNotFoundError, suggest updating requirements.txt (and related files if needed).
+2. If the logs mention formatting, black, or ruff format, suggest applying format fixes to affected files.
+3. If the logs mention lint, flake8, or ruff, suggest applying patches to the affected files.
+4. Prefer minimal multi-file edits when required; keep changes practical.
+5. Keep the output concise.
 
 Project ID: {failure.project_id}
 Pipeline ID: {failure.pipeline_id}

@@ -234,6 +234,47 @@ class BitbucketAPIClient:
             traceback.print_exc()
             return None
 
+    async def get_file_contents(
+        self, project_id: str, branch: str, file_path: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch raw file contents at a given ref via GET /src/{ref}/{path}.
+
+        Returns {"exists": False} (not None) for missing files so callers can
+        distinguish "new file" from an API failure.
+        """
+        print(f"[DEBUG] get_file_contents called | project_id={project_id} | branch={branch} | file_path={file_path}")
+
+        repo_path = await self._get_repo_path(project_id)
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0, auth=self._auth) as client:
+                resp = await client.get(
+                    f"{self.BASE_URL}/repositories/{repo_path}/src/{branch}/{file_path}",
+                )
+                if resp.status_code == 404:
+                    print(f"[DEBUG] File {file_path} not found on branch {branch}")
+                    return {
+                        "file_path": file_path,
+                        "branch": branch,
+                        "exists": False,
+                        "content": None,
+                    }
+                resp.raise_for_status()
+                print(f"[DEBUG] Fetched {file_path} ({len(resp.text)} chars)")
+                return {
+                    "file_path": file_path,
+                    "branch": branch,
+                    "exists": True,
+                    "content": resp.text,
+                }
+
+        except Exception as e:
+            print(f"[ERROR] Failed to fetch file contents: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     async def update_file(
         self,
         project_id: str,

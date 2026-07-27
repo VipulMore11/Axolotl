@@ -79,6 +79,11 @@ class MongoDBService:
 
         print("Created indexes for users collection")
 
+        # Fixes awaiting human approval; the knowledge graph itself lives in Neo4j
+        pending = self.db["pending_fixes"]
+        await pending.create_index([("project_id", 1), ("mr_iid", 1)])
+        await pending.create_index("pipeline_id")
+
         # ── Startup migration: backfill 'provider' on legacy documents ──
         await self._migrate_provider_fields()
 
@@ -373,6 +378,55 @@ class MongoDBService:
             project["_id"] = str(project["_id"])
             results.append(project)
         return results
+
+    # ============ Pending Fixes (post-HITL KB) ============
+
+    async def save_pending_fix(self, fix_data: Dict[str, Any]) -> str:
+        """Persist a fix awaiting human approval for later KB extraction."""
+        collection = self.db["pending_fixes"]
+        fix_data = {**fix_data, "updated_at": datetime.now(UTC)}
+        if "created_at" not in fix_data:
+            fix_data["created_at"] = datetime.now(UTC)
+
+        filt: Dict[str, Any] = {
+            "project_id": str(fix_data.get("project_id", "")),
+        }
+        if fix_data.get("mr_iid"):
+            filt["mr_iid"] = str(fix_data["mr_iid"])
+        elif fix_data.get("pipeline_id"):
+            filt["pipeline_id"] = str(fix_data["pipeline_id"])
+
+        result = await collection.find_one_and_update(
+            filt,
+            {"$set": fix_data},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return str(result.get("_id", "")) if result else ""
+
+    async def get_pending_fix(
+        self,
+        project_id: str,
+        mr_iid: Optional[str] = None,
+        pipeline_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        collection = self.db["pending_fixes"]
+        query: Dict[str, Any] = {"project_id": str(project_id)}
+        if mr_iid is not None:
+            query["mr_iid"] = str(mr_iid)
+        if pipeline_id is not None:
+            query["pipeline_id"] = str(pipeline_id)
+        return await collection.find_one(query, sort=[("updated_at", -1)])
+
+    async def mark_pending_fix_status(
+        self, project_id: str, mr_iid: str, status: str
+    ) -> bool:
+        collection = self.db["pending_fixes"]
+        result = await collection.update_one(
+            {"project_id": str(project_id), "mr_iid": str(mr_iid)},
+            {"$set": {"status": status, "updated_at": datetime.now(UTC)}},
+        )
+        return result.modified_count > 0
 
     # ============ Migration Operations ============
 

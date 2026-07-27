@@ -271,6 +271,41 @@ class GitLabMCPClient:
             traceback.print_exc()
             return None
 
+    async def get_file_contents(
+        self, project_id: str, branch: str, file_path: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch the raw contents of a file at a given ref.
+
+        Returns {"exists": False} (not None) for missing files so callers can
+        distinguish "new file" from an API failure.
+        """
+        print(f"[DEBUG] get_file_contents called | project_id={project_id} | branch={branch} | file_path={file_path}")
+
+        client = await self._get_or_create_client(project_id)
+        if not client:
+            return None
+
+        try:
+            project = client.projects.get(project_id)
+            file_obj = project.files.get(file_path, ref=branch)
+            content = file_obj.decode().decode("utf-8", errors="replace")
+            print(f"[DEBUG] Fetched {file_path} ({len(content)} chars)")
+            return {
+                "file_path": file_path,
+                "branch": branch,
+                "exists": True,
+                "content": content,
+            }
+        except gitlab.exceptions.GitlabGetError:
+            print(f"[DEBUG] File {file_path} not found on branch {branch}")
+            return {"file_path": file_path, "branch": branch, "exists": False, "content": None}
+        except Exception as e:
+            print(f"[ERROR] Failed to fetch file contents: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     async def update_file(self, project_id: str, branch: str, file_path: str, content: str, commit_message: str) -> Optional[Dict[str, Any]]:
         """
         Update or create a file and commit the changes.

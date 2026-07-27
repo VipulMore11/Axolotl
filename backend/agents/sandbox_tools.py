@@ -203,7 +203,7 @@ def validate_patch(
     content: str,
     logs: str = "",
 ) -> CheckResult:
-    """Reset workspace, write the patch, and run the allowlisted check."""
+    """Reset workspace, write a single patch, and run the allowlisted check."""
     workspace = reset_workspace(pipeline_id)
     try:
         write_temp_file(workspace, file_path, content)
@@ -211,6 +211,58 @@ def validate_patch(
         return CheckResult(passed=False, output=str(exc), command="write_temp_file")
 
     return run_check(workspace, file_path, logs)
+
+
+@traceable(name="docker_validate_patches", run_type="tool")
+def validate_patches(
+    pipeline_id: str,
+    file_patches: list[dict],
+    logs: str = "",
+) -> CheckResult:
+    """
+    Write all patches into one workspace and run checks.
+
+    For deps/ModuleNotFound → pip install -r on requirements.txt if present.
+    Otherwise run allowlisted check on each Python file; first failure wins.
+    """
+    if not file_patches:
+        return CheckResult(passed=False, output="No file_patches provided", command="validate_patches")
+
+    workspace = reset_workspace(pipeline_id)
+    written: list[str] = []
+    for patch in file_patches:
+        path = (patch.get("file_path") if isinstance(patch, dict) else getattr(patch, "file_path", "")) or ""
+        content = (patch.get("updated_content") if isinstance(patch, dict) else getattr(patch, "updated_content", "")) or ""
+        try:
+            write_temp_file(workspace, path, content)
+            written.append(path)
+        except ValueError as exc:
+            return CheckResult(passed=False, output=str(exc), command="write_temp_file")
+
+    # Prefer requirements.txt check when present or ModuleNotFound in logs
+    req = next((p for p in written if p.replace("\\", "/").endswith("requirements.txt")), None)
+    logs_lower = (logs or "").lower()
+    if req or "modulenotfounderror" in logs_lower or "no module named" in logs_lower:
+        target = req or "requirements.txt"
+        if (workspace / target).exists() or req:
+            return run_check(workspace, req or target, logs)
+
+    outputs: list[str] = []
+    for path in written:
+        result = run_check(workspace, path, logs)
+        outputs.append(f"$ {result.command}\n{result.output}")
+        if not result.passed:
+            return CheckResult(
+                passed=False,
+                output="\n\n".join(outputs),
+                command=result.command,
+            )
+
+    return CheckResult(
+        passed=True,
+        output="\n\n".join(outputs) or "all patches validated",
+        command="validate_patches",
+    )
 
 
 def cleanup_workspace(pipeline_id: str) -> None:

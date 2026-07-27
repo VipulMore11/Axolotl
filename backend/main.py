@@ -8,7 +8,7 @@ Combines all routers:
   - GitLab webhook routes (Person 2)
   - Health check
 
-Manages MongoDB lifecycle on startup/shutdown.
+Manages MongoDB and Neo4j lifecycle on startup/shutdown.
 """
 
 from contextlib import asynccontextmanager
@@ -29,13 +29,15 @@ from api.activity_routes import router as activity_router
 from api.settings_routes import router as settings_router
 from auth.routes import router as auth_router
 from db.mongo_service import get_mongo_service
+from db.neo4j_service import get_neo4j_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Application lifespan manager.
-    Connects to MongoDB on startup, disconnects on shutdown.
+    Connects to MongoDB and the Neo4j knowledge base on startup, disconnects on
+    shutdown. A missing or unreachable Neo4j only disables KB grounding.
     """
     # ── Startup ──
     from agents.langsmith_tracing import configure_langsmith
@@ -43,9 +45,12 @@ async def lifespan(app: FastAPI):
     configure_langsmith()
     mongo = get_mongo_service()
     await mongo.connect()
+    neo4j = get_neo4j_service()
+    await neo4j.connect()
     print("Axolotl backend started.")
     yield
     # ── Shutdown ──
+    await neo4j.disconnect()
     await mongo.disconnect()
     print("Axolotl backend stopped.")
 

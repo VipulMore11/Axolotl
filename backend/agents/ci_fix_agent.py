@@ -75,9 +75,9 @@ class LegacyCIFixAgent(BaseAgent):
 
             return FixProposal(
                 root_cause=str(payload.get("root_cause", "AI-generated fix proposal.")),
+                commit_message=str(payload.get("commit_message", "fix: apply AI-generated patch")),
                 file_path=str(payload.get("file_path", "")),
                 updated_content=str(payload.get("updated_content", "")),
-                commit_message=str(payload.get("commit_message", "fix: apply AI-generated patch")),
             )
         except Exception as exc:
             raise CIFixAgentError(f"CI fix analysis failed: {exc}") from exc
@@ -112,6 +112,11 @@ class CIFixAgent(BaseAgent):
         """Attach a live stage callback (used by the orchestrator for WebSocket events)."""
         if hasattr(self._impl, "set_on_stage"):
             self._impl.set_on_stage(on_stage)
+
+    def set_file_fetcher(self, fetcher) -> None:
+        """Attach a repo file reader used by the search/replace patch engine."""
+        if hasattr(self._impl, "set_file_fetcher"):
+            self._impl.set_file_fetcher(fetcher)
 
     @override
     async def analyze(self, failure: PipelineFailure) -> FixProposal:

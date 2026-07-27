@@ -91,6 +91,28 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="get_file_contents",
+            description="Fetch the raw contents of a file at a given branch. Returns exists=false when the file is missing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Internal project ID (from MongoDB)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch or ref to read from"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file in the repository"
+                    }
+                },
+                "required": ["project_id", "branch", "file_path"]
+            }
+        ),
+        Tool(
             name="update_file",
             description="Update or create a file and commit the changes to Bitbucket.",
             inputSchema={
@@ -212,6 +234,31 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
             else:
                 return CallToolResult(
                     content=[TextContent(type="text", text="create_branch returned None — check Bitbucket auth and branch permissions")],
+                    isError=True
+                )
+
+        elif name == "get_file_contents":
+            try:
+                result = await bitbucket_client.get_file_contents(
+                    arguments["project_id"],
+                    arguments["branch"],
+                    arguments["file_path"]
+                )
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"get_file_contents exception: {e}\n{tb}")],
+                    isError=True
+                )
+            if result:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=json.dumps(result, indent=2))],
+                    isError=False
+                )
+            else:
+                return CallToolResult(
+                    content=[TextContent(type="text", text="get_file_contents returned None — check Bitbucket auth and repo path")],
                     isError=True
                 )
 

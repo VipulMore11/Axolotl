@@ -66,7 +66,7 @@ def configure_langsmith() -> bool:
         os.environ["LANGSMITH_ENDPOINT"] = endpoint
         os.environ["LANGCHAIN_ENDPOINT"] = endpoint
 
-    print(f"[LangSmith] Tracing enabled → project={project}")
+    print(f"[LangSmith] Tracing enabled -> project={project}")
     return True
 
 

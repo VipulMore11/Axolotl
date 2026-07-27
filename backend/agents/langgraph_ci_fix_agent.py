@@ -1,9 +1,8 @@
 """
 LangGraph CI fix agent — eight-stage Evaluator-Optimizer pipeline.
 
-Artifact contracts (not chat transcripts) pass between persona nodes:
-  Analyst (Flash) → Architect (Pro) → Tech Lead (Flash) → Developer (Pro)
-  → Docker validate → Evaluator (Pro) ⇄ Developer on failure.
+Artifact contracts (not chat transcripts) pass between persona nodes.
+Supports multi-file patches and Knowledge Base graph grounding.
 
 Stage 8 (git_operations) runs in the orchestrator via MCP after FixProposal.
 """
@@ -29,12 +28,25 @@ from agents.ci_fix_state import (
     ArchitecturePlan,
     CIFixState,
     CritiqueResult,
+    FilePatch,
     empty_architecture_plan,
 )
 from agents.exceptions import CIFixAgentError
+from agents.knowledge_store import get_knowledge_store
 from agents.langsmith_tracing import build_run_config, configure_langsmith
+from agents.patch_utils import (
+    DEFAULT_FUZZY_THRESHOLD,
+    apply_blocks,
+    apply_fuzzy_patch,
+    build_block_failure_feedback,
+    extract_line_hints,
+    find_nearest_match,
+    line_hint_for,
+    normalize_patch_path,
+)
 from agents.prompt_builder import PromptBuilder
-from agents.sandbox_tools import cleanup_workspace, reset_workspace, validate_patch
+from agents.sandbox_tools import cleanup_workspace, reset_workspace, validate_patches
+from schemas.fix import FilePatch as FixFilePatch
 from schemas.fix import FixProposal
 from schemas.pipeline import PipelineFailure
 
@@ -42,7 +54,8 @@ load_dotenv()
 
 StageCallback = Callable[[str, str, Optional[dict]], Awaitable[None] | None]
 
-# ── Pydantic mirrors of artifact contracts (structured LLM output) ──
+
+# ── Pydantic artifact mirrors ──
 
 
 class DiagnosisResult(BaseModel):
@@ -50,55 +63,63 @@ class DiagnosisResult(BaseModel):
 
 
 class ArchitecturePlanModel(BaseModel):
-    strategy_type: str = Field(
-        description="One of: deps, lint, format, code_patch"
-    )
+    strategy_type: str = Field(description="One of: deps, lint, format, code_patch")
     affected_files: list[str] = Field(
-        description="Relative file paths expected to change (prefer one)"
+        description="All relative file paths that need edits"
     )
-    proposed_solution: str = Field(
-        description="Low-blast-radius solution summary"
-    )
+    proposed_solution: str = Field(description="Low-blast-radius solution summary")
 
 
 class TaskBreakdownResult(BaseModel):
-    task_breakdown: list[str] = Field(
-        description="Ordered checklist of 3-6 execution steps"
+    task_breakdown: list[str] = Field(description="Ordered checklist of 3-6 steps")
+
+
+class SearchReplaceBlockModel(BaseModel):
+    """Aider-style code-surgery block (single-pass generation, TRD addendum)."""
+
+    file_path: str = Field(description="Relative path of the file to change")
+    search_block: str = Field(
+        description=(
+            "Lines copied CHARACTER-FOR-CHARACTER from the provided file contents "
+            "(exact whitespace and indentation). Empty only when creating a new file."
+        )
     )
+    replace_block: str = Field(description="Replacement lines for the search_block")
 
 
-class PatchProposal(BaseModel):
+class SearchReplaceProposal(BaseModel):
     root_cause: str = Field(description="Root cause summary")
-    file_path: str = Field(description="Relative path of the single file to change")
-    updated_content: str = Field(description="Full updated file contents")
+    blocks: list[SearchReplaceBlockModel] = Field(
+        description="Ordered SEARCH/REPLACE blocks; multiple blocks per file allowed"
+    )
     commit_message: str = Field(description="Short conventional commit message")
 
 
 class CritiqueResultModel(BaseModel):
-    satisfactory: bool = Field(description="True only if patch matches the architecture plan")
+    satisfactory: bool = Field(description="True only if patches match the architecture plan")
     issues: list[str] = Field(
-        description="Problems found; cite specific line numbers when rejecting"
+        description="Problems found; cite file paths and line numbers when rejecting"
     )
     revision_instructions: list[str] = Field(
         description="Concrete edit instructions for the developer agent"
     )
 
 
-# ── Persona system prompts ──
+# ── Personas ──
 
 
 def _persona_analyst() -> str:
     return """You are the Analyst Agent for Axolotl CI repair.
 Extract a precise root cause from CI logs. Prefer ModuleNotFoundError / lint / format failures.
+If historical KB context is provided, use it to refine the diagnosis when it clearly matches.
 Be concise. Return only the requested structured fields."""
 
 
 def _persona_architect() -> str:
     return """You are the Architect Agent for Axolotl CI repair.
-Design a low-blast-radius, single-file fix strategy.
-strategy_type must be one of: deps, lint, format, code_patch.
-Prefer requirements.txt for missing modules; prefer minimal patches for lint/format.
-List affected_files (usually one path). Return only the ArchitecturePlan fields."""
+Design a low-blast-radius fix. strategy_type must be one of: deps, lint, format, code_patch.
+List ALL affected_files that need modification (multi-file allowed when necessary).
+Prefer requirements.txt for missing modules. Return ArchitecturePlan fields only."""
 
 
 def _persona_tech_lead() -> str:
@@ -108,22 +129,27 @@ Do not write code. Return only task_breakdown as a list of strings."""
 
 
 def _persona_developer() -> str:
-    return """You are the Developer Agent for Axolotl CI repair.
-Produce a single-file patch (file_path, full updated_content, commit_message).
-MVP rules:
-1. ModuleNotFoundError → update requirements.txt
-2. black/ruff format → apply formatting fix
-3. lint/flake8/ruff → patch the affected file
-When revising, PRESERVE successful work: apply targeted edits to the existing
-updated_content using validation_failures and review revision_instructions.
-Do not rewrite from scratch unless the prior content is empty or unusable."""
+    return """You are the Developer Agent for Axolotl CI repair — a precise code surgeon.
+You fix code by emitting SEARCH/REPLACE blocks, never whole files.
+Strict rules:
+1. search_block must be copied CHARACTER-FOR-CHARACTER from the provided file contents:
+   exact whitespace, exact indentation, exact blank lines. Never retype from memory.
+2. Keep each block minimal — only the lines that change plus 1-2 unchanged anchor lines.
+3. Multiple blocks per file are allowed; they apply top to bottom.
+4. To create a NEW file, use an empty search_block and put the full contents in replace_block.
+5. Never put line-number prefixes or markdown fences inside blocks.
+Fix guidance:
+- ModuleNotFoundError → add the dependency to requirements.txt (imports only if required)
+- black/ruff format or lint errors → patch only the offending lines
+When revising, PRESERVE successful work: emit blocks only for what must still change,
+guided by validation_failures and review revision_instructions."""
 
 
 def _persona_evaluator() -> str:
     return """You are the Evaluator Agent for Axolotl CI repair.
-Compare updated_content against root_cause and architecture_plan.
-Approve only if the patch is minimal, correct, and matches the plan.
-If rejecting: issues MUST cite specific line numbers in the updated content,
+Compare file_patches against root_cause and architecture_plan.
+Approve only if the patches are minimal, correct, and match the plan.
+If rejecting: issues MUST cite file paths and line numbers,
 and revision_instructions must be concrete actionable edits.
 Return CritiqueResult fields only."""
 
@@ -143,19 +169,11 @@ def _max_attempts() -> int:
 
 
 def _flash_model() -> str:
-    return (
-        os.getenv("GEMINI_FLASH_MODEL")
-        or os.getenv("GEMINI_MODEL")
-        or "gemini-2.5-flash"
-    )
+    return os.getenv("GEMINI_FLASH_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
 
 
 def _pro_model() -> str:
-    return (
-        os.getenv("GEMINI_PRO_MODEL")
-        or os.getenv("GEMINI_MODEL")
-        or "gemini-2.5-pro"
-    )
+    return os.getenv("GEMINI_PRO_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.5-pro"
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -182,8 +200,24 @@ def _plan_as_dict(plan: Any) -> ArchitecturePlan:
     return empty_architecture_plan()
 
 
+def _normalize_patches(raw: Any) -> list[FilePatch]:
+    patches: list[FilePatch] = []
+    if not raw:
+        return patches
+    for item in raw:
+        if isinstance(item, dict):
+            path = str(item.get("file_path") or "")
+            content = str(item.get("updated_content") or "")
+        else:
+            path = str(getattr(item, "file_path", "") or "")
+            content = str(getattr(item, "updated_content", "") or "")
+        if path:
+            patches.append({"file_path": path, "updated_content": content})
+    return patches
+
+
 class LangGraphCIFixAgent(BaseAgent):
-    """Eight-stage CI fix via LangGraph with Flash/Pro personas and artifact contracts."""
+    """Eight-stage CI fix with Flash/Pro personas, multi-file patches, and KB grounding."""
 
     def __init__(self, on_stage: Optional[StageCallback] = None) -> None:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -191,25 +225,49 @@ class LangGraphCIFixAgent(BaseAgent):
             raise ValueError("GEMINI_API_KEY is not set")
 
         self.on_stage = on_stage
+        self.file_fetcher: Optional[Callable[[str], Awaitable[Optional[str]] | Optional[str]]] = None
         self.langsmith_enabled = configure_langsmith()
         self.validate_enabled = _env_bool("CI_FIX_VALIDATE", True)
         self.max_attempts = _max_attempts()
+        try:
+            self.block_retries = max(0, int(os.getenv("CI_FIX_BLOCK_RETRIES", "2")))
+        except ValueError:
+            self.block_retries = 2
+        try:
+            self.fuzzy_threshold = float(
+                os.getenv("CI_FIX_FUZZY_THRESHOLD", str(DEFAULT_FUZZY_THRESHOLD))
+            )
+        except ValueError:
+            self.fuzzy_threshold = DEFAULT_FUZZY_THRESHOLD
         self.flash_model = _flash_model()
         self.pro_model = _pro_model()
         self.llm_flash = ChatGoogleGenerativeAI(
-            model=self.flash_model,
-            google_api_key=api_key,
-            temperature=0,
+            model=self.flash_model, google_api_key=api_key, temperature=0
         )
         self.llm_pro = ChatGoogleGenerativeAI(
-            model=self.pro_model,
-            google_api_key=api_key,
-            temperature=0,
+            model=self.pro_model, google_api_key=api_key, temperature=0
         )
         self._graph = self._build_graph()
 
     def set_on_stage(self, on_stage: Optional[StageCallback]) -> None:
         self.on_stage = on_stage
+
+    def set_file_fetcher(self, fetcher) -> None:
+        """Attach a callable(file_path) -> str|None that reads repo files (MCP-backed)."""
+        self.file_fetcher = fetcher
+
+    async def _fetch_original(self, file_path: str) -> Optional[str]:
+        """Fetch original repo contents for a file; None when missing/unavailable."""
+        if self.file_fetcher is None:
+            return None
+        try:
+            result = self.file_fetcher(file_path)
+            if inspect.isawaitable(result):
+                result = await result
+            return result if isinstance(result, str) else None
+        except Exception as exc:
+            print(f"[PatchEngine] Failed to fetch {file_path}: {exc}")
+            return None
 
     async def _emit(self, stage: str, message: str, metadata: Optional[dict] = None) -> None:
         if not self.on_stage:
@@ -246,10 +304,7 @@ class LangGraphCIFixAgent(BaseAgent):
         workflow.add_conditional_edges(
             "code_review",
             self._route_after_review,
-            {
-                "end": END,
-                "code_implementation": "code_implementation",
-            },
+            {"end": END, "code_implementation": "code_implementation"},
         )
         return workflow.compile()
 
@@ -261,22 +316,45 @@ class LangGraphCIFixAgent(BaseAgent):
         )
         reset_workspace(state["pipeline_id"])
         seed = (
-            f"Workspace ready.\n"
-            f"Project: {state['project_id']}\n"
-            f"Pipeline: {state['pipeline_id']}\n"
-            f"Branch: {state['branch']}"
+            f"Workspace ready.\nProject: {state['project_id']}\n"
+            f"Pipeline: {state['pipeline_id']}\nBranch: {state['branch']}"
         )
-        return {
-            "current_stage": "workspace_setup",
-            "messages": [SystemMessage(content=seed)],
-        }
+        return {"current_stage": "workspace_setup", "messages": [SystemMessage(content=seed)]}
 
     async def _requirements_analysis(self, state: CIFixState) -> dict[str, Any]:
         await self._emit(
             "requirements_analysis",
-            "Analyst (Flash): extracting root cause from CI logs...",
+            "Analyst (Flash): KB grounding + root-cause extraction...",
             {"model": self.flash_model},
         )
+
+        kb_grounding = ""
+        try:
+            store = get_knowledge_store()
+            historical = await store.find_historical_fixes(
+                project_id=state["project_id"],
+                error_text=state.get("logs") or "",
+                limit=3,
+            )
+            if historical:
+                lines = []
+                for h in historical:
+                    lines.append(
+                        f"- Claim: {h.get('claim_label')}\n"
+                        f"  Prior fix: {h.get('artifact_summary')}\n"
+                        f"  Commit: {h.get('commit_message')}\n"
+                        f"  Patches: {json.dumps(h.get('artifact_patches') or [])[:800]}"
+                    )
+                kb_grounding = "Historical KB matches:\n" + "\n".join(lines)
+                await self._emit(
+                    "requirements_analysis",
+                    f"KB grounding: {len(historical)} historical claim(s) found",
+                    {"kb_hits": len(historical)},
+                )
+        except Exception as exc:
+            print(f"[KB] grounding lookup failed: {exc}")
+            kb_grounding = ""
+
         prompt = PromptBuilder.build_prompt(
             PipelineFailure(
                 project_id=state["project_id"],
@@ -285,7 +363,11 @@ class LangGraphCIFixAgent(BaseAgent):
                 logs=state["logs"],
             )
         )
-        human = f"{prompt}\n\nRespond with JSON: {{\"root_cause\": \"...\"}}"
+        human = (
+            f"{prompt}\n\n"
+            f"{kb_grounding}\n\n"
+            'Respond with JSON: {"root_cause": "..."}'
+        )
         structured = self.llm_flash.with_structured_output(DiagnosisResult)
         try:
             result = await structured.ainvoke(
@@ -299,6 +381,15 @@ class LangGraphCIFixAgent(BaseAgent):
             payload = _extract_json_object(getattr(response, "content", "") or "")
             root_cause = str(payload.get("root_cause", "Unknown CI failure"))
 
+        # Line hints for the middle-out patch search (regex over stack traces; no LLM cost)
+        line_hints = extract_line_hints(state.get("logs") or "")
+        if line_hints:
+            await self._emit(
+                "requirements_analysis",
+                f"Line hints from stack trace: {json.dumps(line_hints)[:300]}",
+                {"line_hints": line_hints},
+            )
+
         await self._emit(
             "requirements_analysis",
             f"Root cause: {root_cause}",
@@ -307,30 +398,33 @@ class LangGraphCIFixAgent(BaseAgent):
         return {
             "current_stage": "requirements_analysis",
             "root_cause": root_cause,
+            "line_hints": line_hints,
+            "kb_grounding": kb_grounding,
             "messages": [HumanMessage(content=human)],
         }
 
     async def _technical_architecture(self, state: CIFixState) -> dict[str, Any]:
         await self._emit(
             "technical_architecture",
-            "Architect (Pro): designing low-blast-radius plan...",
-            {"model": self.pro_model, "root_cause": state.get("root_cause")},
+            "Architect (Pro): designing multi-file plan...",
+            {"model": self.pro_model},
         )
         human = (
             f"Root cause: {state.get('root_cause')}\n"
+            f"KB grounding:\n{state.get('kb_grounding') or '(none)'}\n"
             f"Logs (excerpt):\n{(state.get('logs') or '')[:4000]}\n\n"
-            "Produce an ArchitecturePlan JSON with strategy_type, affected_files, "
-            "proposed_solution. Prefer a single-file fix."
+            "Produce ArchitecturePlan JSON. List every affected file."
         )
         structured = self.llm_pro.with_structured_output(ArchitecturePlanModel)
         try:
             result = await structured.ainvoke(
                 [SystemMessage(content=_persona_architect()), HumanMessage(content=human)]
             )
-            if isinstance(result, ArchitecturePlanModel):
-                plan = result.model_dump()
-            else:
-                plan = ArchitecturePlanModel.model_validate(result).model_dump()
+            plan = (
+                result.model_dump()
+                if isinstance(result, ArchitecturePlanModel)
+                else ArchitecturePlanModel.model_validate(result).model_dump()
+            )
         except Exception:
             response = await self.llm_pro.ainvoke(
                 [SystemMessage(content=_persona_architect()), HumanMessage(content=human)]
@@ -340,7 +434,7 @@ class LangGraphCIFixAgent(BaseAgent):
                 "strategy_type": str(payload.get("strategy_type") or "code_patch"),
                 "affected_files": list(payload.get("affected_files") or []),
                 "proposed_solution": str(
-                    payload.get("proposed_solution") or "Apply a minimal single-file patch."
+                    payload.get("proposed_solution") or "Apply a minimal patch set."
                 ),
             }
 
@@ -364,7 +458,7 @@ class LangGraphCIFixAgent(BaseAgent):
         await self._emit(
             "task_breakdown",
             "Tech Lead (Flash): breaking plan into tasks...",
-            {"model": self.flash_model, "strategy_type": plan.get("strategy_type")},
+            {"model": self.flash_model},
         )
         human = (
             f"Root cause: {state.get('root_cause')}\n"
@@ -376,10 +470,11 @@ class LangGraphCIFixAgent(BaseAgent):
             result = await structured.ainvoke(
                 [SystemMessage(content=_persona_tech_lead()), HumanMessage(content=human)]
             )
-            if isinstance(result, TaskBreakdownResult):
-                tasks = list(result.task_breakdown)
-            else:
-                tasks = list(TaskBreakdownResult.model_validate(result).task_breakdown)
+            tasks = list(
+                result.task_breakdown
+                if isinstance(result, TaskBreakdownResult)
+                else TaskBreakdownResult.model_validate(result).task_breakdown
+            )
         except Exception:
             response = await self.llm_flash.ainvoke(
                 [SystemMessage(content=_persona_tech_lead()), HumanMessage(content=human)]
@@ -392,9 +487,9 @@ class LangGraphCIFixAgent(BaseAgent):
                 tasks = [line.strip(" -") for line in raw.splitlines() if line.strip()]
             else:
                 tasks = [
-                    "Edit the target file per architecture plan",
-                    "Validate in Docker sandbox",
-                    "Prepare commit message",
+                    "Edit listed affected files",
+                    "Validate all patches in sandbox",
+                    "Prepare single commit message",
                 ]
 
         await self._emit(
@@ -408,41 +503,97 @@ class LangGraphCIFixAgent(BaseAgent):
             "messages": [HumanMessage(content=human)],
         }
 
+    # ── Stage 5: single-pass Search/Replace code surgery ──
+
+    _FILE_CONTEXT_CHAR_CAP = 24000
+    _HINT_WINDOW_LINES = 120
+
+    def _file_context_section(
+        self, path: str, content: Optional[str], hint: Optional[int]
+    ) -> str:
+        """One file's contents for the developer prompt (hint-windowed if huge)."""
+        if content is None:
+            return f"### {path} (NEW FILE — does not exist yet; create it with an empty search_block)"
+        if len(content) <= self._FILE_CONTEXT_CHAR_CAP:
+            return f"### {path}\n{content}"
+        lines = content.splitlines()
+        center = (hint - 1) if hint else len(lines) // 2
+        lo = max(0, center - self._HINT_WINDOW_LINES)
+        hi = min(len(lines), center + self._HINT_WINDOW_LINES)
+        head = "\n".join(lines[:30])
+        window = "\n".join(lines[lo:hi])
+        return (
+            f"### {path} (PARTIAL VIEW — file has {len(lines)} lines; "
+            f"showing the head and lines {lo + 1}-{hi} around the failure)\n"
+            f"{head}\n... (lines omitted) ...\n{window}\n... (lines omitted) ..."
+        )
+
     async def _code_implementation(self, state: CIFixState) -> dict[str, Any]:
         plan = _plan_as_dict(state.get("architecture_plan"))
         failures = list(state.get("validation_failures") or [])
         history = list(state.get("review_history") or [])
-        is_revision = bool(failures or history) and bool(state.get("updated_content"))
+        existing = _normalize_patches(state.get("file_patches"))
+        is_revision = bool(failures or history) and bool(existing)
+        hints = dict(state.get("line_hints") or {})
+        baseline: dict[str, Optional[str]] = dict(state.get("file_contents") or {})
 
         await self._emit(
             "code_implementation",
             (
-                "Developer (Pro): applying targeted revision..."
+                "Developer (Pro): targeted SEARCH/REPLACE revision..."
                 if is_revision
-                else "Developer (Pro): implementing single-file fix..."
+                else "Developer (Pro): generating SEARCH/REPLACE blocks (single pass)..."
             ),
             {
                 "model": self.pro_model,
                 "attempt": int(state.get("attempts") or 0) + 1,
                 "revision": is_revision,
-                "strategy_type": plan.get("strategy_type"),
+                "affected_files": plan.get("affected_files"),
             },
         )
+
+        # ── Gather real file contents (originals via MCP-backed fetcher) ──
+        target_files = list(
+            dict.fromkeys(
+                [normalize_patch_path(p["file_path"]) for p in existing]
+                + [normalize_patch_path(f) for f in (plan.get("affected_files") or [])]
+            )
+        )
+        for path in target_files:
+            if path not in baseline:
+                baseline[path] = await self._fetch_original(path)
+
+        patched_now = {normalize_patch_path(p["file_path"]): p["updated_content"] for p in existing}
+        working: dict[str, str] = {}
+        for path in target_files:
+            if is_revision and path in patched_now:
+                working[path] = patched_now[path]
+            else:
+                working[path] = baseline.get(path) or ""
+
+        sections = []
+        for path in target_files:
+            shown = working[path] if (is_revision and path in patched_now) else baseline.get(path)
+            sections.append(
+                self._file_context_section(path, shown, line_hint_for(hints, path))
+            )
+        files_context = "\n\n".join(sections) or "(no file contents available)"
 
         tasks = state.get("task_breakdown") or []
         if is_revision:
             last_critique = history[-1] if history else None
             human = (
-                f"TARGETED REVISION — preserve successful work in the existing file.\n"
+                "TARGETED REVISION — emit SEARCH/REPLACE blocks ONLY for what must still change.\n"
                 f"Root cause: {state.get('root_cause')}\n"
                 f"ArchitecturePlan: {json.dumps(plan)}\n"
                 f"Tasks: {json.dumps(tasks)}\n"
-                f"Current file_path: {state.get('file_path')}\n"
-                f"Current updated_content:\n{state.get('updated_content')}\n"
                 f"validation_failures: {json.dumps(failures[-3:])}\n"
+                f"patch apply failures: {json.dumps(list(state.get('patch_failures') or [])[-3:])}\n"
                 f"latest critique: {json.dumps(last_critique)}\n\n"
-                "Apply only the revision_instructions / validation fixes. "
-                "Return PatchProposal JSON (root_cause, file_path, updated_content, commit_message)."
+                "CURRENT FILE CONTENTS (your prior patches are already applied — "
+                "search blocks must match THIS text exactly):\n"
+                f"{files_context}\n\n"
+                "Return SearchReplaceProposal JSON: blocks + commit_message."
             )
         else:
             human = (
@@ -450,69 +601,196 @@ class LangGraphCIFixAgent(BaseAgent):
                 f"Pipeline: {state['pipeline_id']}\n"
                 f"Branch: {state['branch']}\n"
                 f"Root cause: {state.get('root_cause')}\n"
+                f"KB grounding:\n{state.get('kb_grounding') or '(none)'}\n"
                 f"ArchitecturePlan: {json.dumps(plan)}\n"
                 f"Tasks: {json.dumps(tasks)}\n"
-                f"Logs:\n{state['logs']}\n\n"
-                "Implement a single-file fix. Return PatchProposal JSON."
+                f"Failure line hints: {json.dumps(hints) or '(none)'}\n"
+                f"Logs (excerpt):\n{(state.get('logs') or '')[:6000]}\n\n"
+                "FILE CONTENTS (search blocks must match this text exactly):\n"
+                f"{files_context}\n\n"
+                "Return SearchReplaceProposal JSON: blocks + commit_message."
             )
 
-        patch = await self._invoke_patch(state, human)
+        proposal = await self._invoke_search_replace(state, human)
+        blocks = proposal["blocks"]
+
+        # ── Apply the blocks through the fuzzy patch engine ──
+        outcome = apply_blocks(blocks, working, hints, self.fuzzy_threshold)
+
+        # ── Rich diagnostic feedback loop: retry ONLY failed blocks ──
+        patch_failures: list[str] = []
+        for failed_block, diagnostics in outcome.failed:
+            path = normalize_patch_path(str(failed_block.get("file_path") or ""))
+            fixed = False
+            for _ in range(self.block_retries):
+                current = outcome.contents.get(path, "")
+                nearest = find_nearest_match(
+                    current, str(failed_block.get("search_block") or ""), context=12
+                )
+                feedback = build_block_failure_feedback(
+                    file_path=path,
+                    error=diagnostics.error,
+                    nearest_match=nearest,
+                    applied_count=len(outcome.applied),
+                    total_count=len(blocks),
+                )
+                await self._emit(
+                    "code_implementation",
+                    f"Block failed in {path}; requesting targeted fix (cached "
+                    f"{len(outcome.applied)}/{len(blocks)} applied blocks)...",
+                    {"file": path, "error": diagnostics.error[:300]},
+                )
+                candidate = await self._invoke_block_fix(failed_block, feedback)
+                if candidate is None:
+                    continue
+                retry = apply_fuzzy_patch(
+                    current,
+                    candidate.get("search_block") or "",
+                    candidate.get("replace_block") or "",
+                    line_hint=line_hint_for(hints, path),
+                    threshold=self.fuzzy_threshold,
+                )
+                if retry.success:
+                    outcome.contents[path] = retry.content
+                    outcome.applied.append(candidate)
+                    fixed = True
+                    break
+                diagnostics = retry
+                failed_block = candidate
+            if not fixed:
+                patch_failures.append(f"{path}: {diagnostics.error}")
+
+        # ── Collect changed files as full-content patches for downstream stages ──
+        patches: list[FilePatch] = [
+            {"file_path": path, "updated_content": content}
+            for path, content in outcome.contents.items()
+            if content != (baseline.get(path) or "")
+        ]
+
+        paths = [p["file_path"] for p in patches]
         await self._emit(
             "code_implementation",
-            f"Proposed `{patch.get('file_path')}`: {patch.get('commit_message')}",
+            (
+                f"Applied {len(outcome.applied)}/{len(blocks)} block(s) across "
+                f"{len(paths)} file(s): {', '.join(paths[:5])} — {proposal['commit_message']}"
+                + (f" | {len(patch_failures)} block(s) unresolved" if patch_failures else "")
+            ),
             {
-                "file_path": patch.get("file_path"),
-                "commit_message": patch.get("commit_message"),
-                "strategy_type": plan.get("strategy_type"),
+                "files": paths,
+                "blocks_applied": len(outcome.applied),
+                "blocks_total": len(blocks),
+                "patch_failures": patch_failures[:5],
+                "commit_message": proposal["commit_message"],
             },
         )
         return {
             "current_stage": "code_implementation",
-            **patch,
+            "root_cause": proposal["root_cause"],
+            "file_patches": patches,
+            "commit_message": proposal["commit_message"],
+            "search_replace_blocks": [
+                {
+                    "file_path": str(b.get("file_path") or ""),
+                    "search_block": str(b.get("search_block") or ""),
+                    "replace_block": str(b.get("replace_block") or ""),
+                }
+                for b in outcome.applied
+            ],
+            "patch_failures": patch_failures,
+            "file_contents": {k: v for k, v in baseline.items() if v is not None},
             "review_approved": False,
+            "messages": [HumanMessage(content=human)],
         }
 
-    async def _invoke_patch(self, state: CIFixState, human: str) -> dict[str, Any]:
-        structured = self.llm_pro.with_structured_output(PatchProposal)
+    async def _invoke_search_replace(self, state: CIFixState, human: str) -> dict[str, Any]:
+        """Single-pass generation of SEARCH/REPLACE blocks (Gemini Pro)."""
+        structured = self.llm_pro.with_structured_output(SearchReplaceProposal)
         try:
             result = await structured.ainvoke(
                 [SystemMessage(content=_persona_developer()), HumanMessage(content=human)]
             )
-            if isinstance(result, PatchProposal):
-                patch = result
-            else:
-                patch = PatchProposal.model_validate(result)
+            proposal = (
+                result
+                if isinstance(result, SearchReplaceProposal)
+                else SearchReplaceProposal.model_validate(result)
+            )
+            blocks = [b.model_dump() for b in proposal.blocks]
+            root_cause = proposal.root_cause
+            commit_message = proposal.commit_message
         except Exception:
             response = await self.llm_pro.ainvoke(
                 [SystemMessage(content=_persona_developer()), HumanMessage(content=human)]
             )
             payload = _extract_json_object(getattr(response, "content", "") or "")
-            patch = PatchProposal(
-                root_cause=str(payload.get("root_cause", state.get("root_cause") or "AI fix")),
-                file_path=str(payload.get("file_path", "")),
-                updated_content=str(payload.get("updated_content", "")),
-                commit_message=str(payload.get("commit_message", "fix: apply AI-generated patch")),
+            raw_blocks = payload.get("blocks") or payload.get("search_replace_blocks") or []
+            blocks = [
+                {
+                    "file_path": str(b.get("file_path", "")),
+                    "search_block": str(b.get("search_block", "")),
+                    "replace_block": str(b.get("replace_block", "")),
+                }
+                for b in raw_blocks
+                if isinstance(b, dict)
+            ]
+            root_cause = str(payload.get("root_cause", state.get("root_cause") or "AI fix"))
+            commit_message = str(
+                payload.get("commit_message", "fix: apply AI-generated patch")
             )
 
         return {
-            "root_cause": patch.root_cause,
-            "file_path": patch.file_path,
-            "updated_content": patch.updated_content,
-            "commit_message": patch.commit_message,
-            "messages": [HumanMessage(content=human)],
+            "blocks": [b for b in blocks if str(b.get("file_path") or "").strip()],
+            "root_cause": root_cause,
+            "commit_message": commit_message,
         }
+
+    async def _invoke_block_fix(
+        self, failed_block: dict[str, str], feedback: str
+    ) -> Optional[dict[str, str]]:
+        """Ask the developer to fix ONLY the failed block (partial retry, TRD C)."""
+        human = (
+            f"{feedback}\n\n"
+            f"The failed block was:\n{json.dumps(failed_block)[:4000]}\n\n"
+            "Return a single SearchReplaceBlock JSON object: "
+            '{"file_path": "...", "search_block": "...", "replace_block": "..."}'
+        )
+        structured = self.llm_pro.with_structured_output(SearchReplaceBlockModel)
+        try:
+            result = await structured.ainvoke(
+                [SystemMessage(content=_persona_developer()), HumanMessage(content=human)]
+            )
+            block = (
+                result
+                if isinstance(result, SearchReplaceBlockModel)
+                else SearchReplaceBlockModel.model_validate(result)
+            )
+            return block.model_dump()
+        except Exception:
+            try:
+                response = await self.llm_pro.ainvoke(
+                    [SystemMessage(content=_persona_developer()), HumanMessage(content=human)]
+                )
+                payload = _extract_json_object(getattr(response, "content", "") or "")
+                if payload.get("search_block") is not None:
+                    return {
+                        "file_path": str(
+                            payload.get("file_path", failed_block.get("file_path", ""))
+                        ),
+                        "search_block": str(payload.get("search_block", "")),
+                        "replace_block": str(payload.get("replace_block", "")),
+                    }
+            except Exception as exc:
+                print(f"[PatchEngine] Block-fix retry failed: {exc}")
+        return None
 
     async def _testing_validation(self, state: CIFixState) -> dict[str, Any]:
         attempts = int(state.get("attempts") or 0) + 1
         failures = list(state.get("validation_failures") or [])
+        patches = _normalize_patches(state.get("file_patches"))
         await self._emit(
             "testing_validation",
-            f"Validating patch in Docker sandbox (attempt {attempts})...",
-            {"attempts": attempts, "file_path": state.get("file_path")},
+            f"Validating {len(patches)} patch(es) in Docker (attempt {attempts})...",
+            {"attempts": attempts, "files": [p["file_path"] for p in patches]},
         )
-
-        file_path = state.get("file_path") or ""
-        content = state.get("updated_content") or ""
 
         if not self.validate_enabled:
             output = "Validation skipped (CI_FIX_VALIDATE=false)."
@@ -525,8 +803,8 @@ class LangGraphCIFixAgent(BaseAgent):
                 "validation_failures": failures,
             }
 
-        if not file_path or not content:
-            output = "Missing file_path or updated_content in proposal."
+        if not patches:
+            output = "No file_patches in proposal."
             failures = failures + [output]
             await self._emit("testing_validation", output, {"passed": False})
             return {
@@ -537,10 +815,9 @@ class LangGraphCIFixAgent(BaseAgent):
                 "validation_failures": failures,
             }
 
-        result = validate_patch(
+        result = validate_patches(
             pipeline_id=state["pipeline_id"],
-            file_path=file_path,
-            content=content,
+            file_patches=patches,
             logs=state.get("logs") or "",
         )
         output = f"$ {result.command}\n{result.output}"
@@ -563,35 +840,38 @@ class LangGraphCIFixAgent(BaseAgent):
     async def _code_review(self, state: CIFixState) -> dict[str, Any]:
         plan = _plan_as_dict(state.get("architecture_plan"))
         history = list(state.get("review_history") or [])
+        patches = _normalize_patches(state.get("file_patches"))
         await self._emit(
             "code_review",
-            "Evaluator (Pro): reviewing patch against architecture plan...",
-            {"model": self.pro_model, "strategy_type": plan.get("strategy_type")},
+            "Evaluator (Pro): reviewing multi-file patches...",
+            {"model": self.pro_model, "files": [p["file_path"] for p in patches]},
         )
-        # Number lines so the evaluator can cite them
-        content = state.get("updated_content") or ""
-        numbered = "\n".join(
-            f"{i:4d}| {line}" for i, line in enumerate(content.splitlines(), start=1)
-        )
+
+        numbered_blocks = []
+        for patch in patches:
+            lines = patch["updated_content"].splitlines()
+            numbered = "\n".join(f"{i:4d}| {line}" for i, line in enumerate(lines, start=1))
+            numbered_blocks.append(f"### {patch['file_path']}\n{numbered}")
+
         human = (
             f"Root cause: {state.get('root_cause')}\n"
             f"ArchitecturePlan: {json.dumps(plan)}\n"
-            f"File: {state.get('file_path')}\n"
             f"Commit message: {state.get('commit_message')}\n"
             f"Validation output:\n{state.get('validation_output')}\n"
-            f"Updated content (line-numbered):\n{numbered}\n\n"
-            "Return CritiqueResult. If unsatisfactory, issues must cite line numbers "
-            "and revision_instructions must be concrete."
+            f"Unresolved patch-apply failures: {json.dumps(list(state.get('patch_failures') or []))}\n"
+            f"Patches (line-numbered):\n" + "\n\n".join(numbered_blocks) + "\n\n"
+            "Return CritiqueResult. If unsatisfactory, cite file:line in issues."
         )
         structured = self.llm_pro.with_structured_output(CritiqueResultModel)
         try:
             result = await structured.ainvoke(
                 [SystemMessage(content=_persona_evaluator()), HumanMessage(content=human)]
             )
-            if isinstance(result, CritiqueResultModel):
-                critique = result.model_dump()
-            else:
-                critique = CritiqueResultModel.model_validate(result).model_dump()
+            critique = (
+                result.model_dump()
+                if isinstance(result, CritiqueResultModel)
+                else CritiqueResultModel.model_validate(result).model_dump()
+            )
         except Exception:
             response = await self.llm_pro.ainvoke(
                 [SystemMessage(content=_persona_evaluator()), HumanMessage(content=human)]
@@ -612,7 +892,6 @@ class LangGraphCIFixAgent(BaseAgent):
         }
         history = history + [critique_td]
         approved = critique_td["satisfactory"]
-
         summary = (
             "approved"
             if approved
@@ -625,7 +904,6 @@ class LangGraphCIFixAgent(BaseAgent):
                 "review_approved": approved,
                 "issues": critique_td["issues"][:5],
                 "revision_instructions": critique_td["revision_instructions"][:5],
-                "strategy_type": plan.get("strategy_type"),
             },
         )
         return {
@@ -656,12 +934,10 @@ class LangGraphCIFixAgent(BaseAgent):
     @override
     @traceable(name="ci_fix_analyze", run_type="chain")
     async def analyze(self, failure: PipelineFailure) -> FixProposal:
-        """Run the eight-stage LangGraph CI fix loop and return a FixProposal."""
         print(
             f"[DEBUG] LangGraphCIFixAgent.analyze | project_id={failure.project_id} "
             f"| pipeline_id={failure.pipeline_id} | validate={self.validate_enabled} "
-            f"| flash={self.flash_model} | pro={self.pro_model} "
-            f"| langsmith={self.langsmith_enabled}"
+            f"| flash={self.flash_model} | pro={self.pro_model}"
         )
         initial: CIFixState = {
             "messages": [],
@@ -670,16 +946,20 @@ class LangGraphCIFixAgent(BaseAgent):
             "branch": failure.branch,
             "logs": failure.logs,
             "root_cause": "",
+            "line_hints": {},
             "architecture_plan": empty_architecture_plan(),
             "task_breakdown": [],
-            "file_path": "",
-            "updated_content": "",
+            "file_contents": {},
+            "search_replace_blocks": [],
+            "patch_failures": [],
+            "file_patches": [],
             "commit_message": "",
             "validation_output": "",
             "validation_passed": False,
             "validation_failures": [],
             "review_history": [],
             "review_approved": False,
+            "kb_grounding": "",
             "attempts": 0,
             "current_stage": "",
         }
@@ -694,6 +974,10 @@ class LangGraphCIFixAgent(BaseAgent):
         run_config["tags"] = list(run_config["tags"]) + [
             "eight-stage",
             "artifact-contract",
+            "multi-file",
+            "kb-grounding",
+            "search-replace",
+            "patch-engine",
             "workspace_setup",
             "requirements_analysis",
             "technical_architecture",
@@ -721,6 +1005,7 @@ class LangGraphCIFixAgent(BaseAgent):
         attempts = int(final_state.get("attempts") or 0)
         validation_output = str(final_state.get("validation_output") or "")
         history = list(final_state.get("review_history") or [])
+        patches = _normalize_patches(final_state.get("file_patches"))
 
         if self.validate_enabled and not validation_passed:
             raise CIFixAgentError(
@@ -732,20 +1017,21 @@ class LangGraphCIFixAgent(BaseAgent):
                 f"Code review rejected after {attempts} attempt(s): "
                 f"{last.get('issues') or last.get('revision_instructions') or 'no critique'}"
             )
-
-        file_path = str(final_state.get("file_path") or "")
-        updated_content = str(final_state.get("updated_content") or "")
-        if not file_path or not updated_content:
-            raise CIFixAgentError("LangGraph agent did not produce a usable patch")
+        if not patches:
+            raise CIFixAgentError("LangGraph agent did not produce any file_patches")
 
         return FixProposal(
             root_cause=str(final_state.get("root_cause") or "AI-generated fix proposal."),
-            file_path=file_path,
-            updated_content=updated_content,
             commit_message=str(
                 final_state.get("commit_message") or "fix: apply AI-generated patch"
             ),
+            file_patches=[
+                FixFilePatch(file_path=p["file_path"], updated_content=p["updated_content"])
+                for p in patches
+            ],
             validation_passed=validation_passed if self.validate_enabled else None,
             validation_output=validation_output if self.validate_enabled else None,
             validation_attempts=attempts if self.validate_enabled else None,
+            architecture_plan=_plan_as_dict(final_state.get("architecture_plan")),
+            kb_grounding=str(final_state.get("kb_grounding") or "") or None,
         )

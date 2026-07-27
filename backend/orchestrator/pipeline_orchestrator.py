@@ -259,6 +259,22 @@ class PipelineOrchestrator:
                 if hasattr(self.ci_fix_agent, "set_on_stage"):
                     self.ci_fix_agent.set_on_stage(on_stage)
 
+                # Repo file reader for the search/replace patch engine: the agent
+                # patches against real file contents instead of regenerating files.
+                async def fetch_file(file_path: str) -> Optional[str]:
+                    result = await self._call_mcp_tool(session, "get_file_contents", {
+                        "project_id": project_id,
+                        "branch": branch,
+                        "file_path": file_path,
+                    })
+                    if result and result.get("exists"):
+                        content = result.get("content")
+                        return content if isinstance(content, str) else None
+                    return None
+
+                if hasattr(self.ci_fix_agent, "set_file_fetcher"):
+                    self.ci_fix_agent.set_file_fetcher(fetch_file)
+
                 failure = PipelineFailure(
                     project_id=project_id,
                     pipeline_id=pipeline_id,
@@ -281,6 +297,8 @@ class PipelineOrchestrator:
                 finally:
                     if hasattr(self.ci_fix_agent, "set_on_stage"):
                         self.ci_fix_agent.set_on_stage(None)
+                    if hasattr(self.ci_fix_agent, "set_file_fetcher"):
+                        self.ci_fix_agent.set_file_fetcher(None)
 
                 # Log the agent trace for observability
                 if self.event_publisher and self.event_publisher.observability:
@@ -292,7 +310,22 @@ class PipelineOrchestrator:
                     )
                     await self.event_publisher.observability.create_trace(trace)
 
-                # ── Step 3–5: Git Operations (MCP branch / commit / MR) ─
+                # ── Step 3–5: Git Operations (MCP branch / multi-file commit / MR) ─
+                patches = list(getattr(fix, "file_patches", None) or [])
+                if not patches and fix.file_path:
+                    from schemas.fix import FilePatch as FixFilePatch
+
+                    patches = [
+                        FixFilePatch(
+                            file_path=fix.file_path,
+                            updated_content=fix.updated_content,
+                        )
+                    ]
+                patch_paths = [
+                    (p.file_path if hasattr(p, "file_path") else p.get("file_path"))
+                    for p in patches
+                ]
+
                 await self._publish_event(
                     EventType.GIT_OPERATIONS,
                     f"Git operations: creating branch '{fix_branch}' from '{branch}'...",
@@ -317,39 +350,48 @@ class PipelineOrchestrator:
 
                 await self._publish_event(
                     EventType.GIT_OPERATIONS,
-                    f"Git operations: committing fix to {fix.file_path}...",
+                    f"Git operations: committing {len(patches)} file(s): {', '.join(str(p) for p in patch_paths[:8])}...",
                     session_id=session_id,
-                    metadata={"step": "commit", "file_path": fix.file_path},
+                    metadata={"step": "commit", "files": patch_paths},
                 )
 
-                update_result = await self._call_mcp_tool(session, "update_file", {
-                    "project_id": project_id,
-                    "branch": fix_branch,
-                    "file_path": fix.file_path,
-                    "content": fix.updated_content,
-                    "commit_message": fix.commit_message,
-                })
-                print(f"[DEBUG] update_file returned: {update_result is not None}")
-
-                if not update_result:
-                    await self._publish_event(
-                        EventType.FIX_FAILED,
-                        f"Failed to commit fix to {fix.file_path}.",
-                        session_id=session_id,
+                for idx, patch in enumerate(patches):
+                    path = patch.file_path if hasattr(patch, "file_path") else patch.get("file_path")
+                    content = (
+                        patch.updated_content
+                        if hasattr(patch, "updated_content")
+                        else patch.get("updated_content")
                     )
-                    return {"status": "failed", "reason": "commit_failed"}
+                    # First file uses the full commit message; subsequent use amend-style note
+                    msg = fix.commit_message if idx == 0 else f"{fix.commit_message} (update {path})"
+                    update_result = await self._call_mcp_tool(session, "update_file", {
+                        "project_id": project_id,
+                        "branch": fix_branch,
+                        "file_path": path,
+                        "content": content,
+                        "commit_message": msg,
+                    })
+                    print(f"[DEBUG] update_file {path} returned: {update_result is not None}")
+                    if not update_result:
+                        await self._publish_event(
+                            EventType.FIX_FAILED,
+                            f"Failed to commit fix to {path}.",
+                            session_id=session_id,
+                        )
+                        return {"status": "failed", "reason": "commit_failed", "file_path": path}
 
                 await self._publish_event(
                     EventType.GIT_OPERATIONS,
                     "Git operations: creating merge request...",
                     session_id=session_id,
-                    metadata={"step": "create_mr"},
+                    metadata={"step": "create_mr", "files": patch_paths},
                 )
 
+                files_md = "\n".join(f"- `{p}`" for p in patch_paths)
                 mr_description = (
                     f"## 🦎 Axolotl Auto-Fix\n\n"
                     f"**Root Cause:** {fix.root_cause}\n\n"
-                    f"**File Changed:** `{fix.file_path}`\n\n"
+                    f"**Files Changed:**\n{files_md}\n\n"
                     f"**Pipeline:** {pipeline_id}\n\n"
                     f"**Branch:** {branch}\n\n"
                     f"---\n"
@@ -374,6 +416,42 @@ class PipelineOrchestrator:
                     )
                     return {"status": "failed", "reason": "mr_creation_failed"}
 
+                # Persist pending fix for post-HITL knowledge extraction
+                if self.mongo_service:
+                    try:
+                        mr_iid = (
+                            mr_result.get("iid")
+                            or mr_result.get("id")
+                            or mr_result.get("number")
+                        )
+                        await self.mongo_service.save_pending_fix({
+                            "project_id": str(project_id),
+                            "pipeline_id": str(pipeline_id),
+                            "mr_iid": str(mr_iid) if mr_iid is not None else "",
+                            "fix_branch": fix_branch,
+                            "root_cause": fix.root_cause,
+                            "commit_message": fix.commit_message,
+                            "file_patches": [
+                                {
+                                    "file_path": (
+                                        p.file_path if hasattr(p, "file_path") else p.get("file_path")
+                                    ),
+                                    "updated_content": (
+                                        p.updated_content
+                                        if hasattr(p, "updated_content")
+                                        else p.get("updated_content")
+                                    ),
+                                }
+                                for p in patches
+                            ],
+                            "architecture_plan": getattr(fix, "architecture_plan", None) or {},
+                            "kb_grounding": getattr(fix, "kb_grounding", None) or "",
+                            "logs_excerpt": combined_logs[:1500],
+                            "status": "awaiting_approval",
+                        })
+                    except Exception as e:
+                        print(f"[KB] Failed to save pending fix: {e}")
+
                 # ── Step 6: Human Approval ──────────────────────────
                 await self._publish_event(
                     EventType.WAITING_APPROVAL,
@@ -391,6 +469,7 @@ class PipelineOrchestrator:
                     "fix": {
                         "root_cause": fix.root_cause,
                         "file_path": fix.file_path,
+                        "file_patches": patch_paths,
                         "commit_message": fix.commit_message,
                     },
                     "merge_request": mr_result,

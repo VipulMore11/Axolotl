@@ -284,6 +284,10 @@ CI_FIX_MAX_ATTEMPTS=3
 # CI_FIX_VALIDATOR_IMAGE=axolotl-validator
 # Set CI_FIX_VALIDATE=false on hosts without Docker (e.g. some PaaS)
 
+# ── Search/Replace patch engine ────────────────────────────
+# CI_FIX_BLOCK_RETRIES=2        # targeted retries per failed SEARCH block
+# CI_FIX_FUZZY_THRESHOLD=0.85   # min Levenshtein similarity for a fuzzy match
+
 # ── LangSmith (optional tracing for LangGraph runs) ───────
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=your_langsmith_api_key_here
@@ -292,6 +296,14 @@ LANGSMITH_PROJECT=axolotl-ci-fix
 
 # ── MongoDB ────────────────────────────────────────────────
 MONGODB_CONNECTION_STRING=mongodb+srv://user:pass@cluster.mongodb.net/axolotl
+
+# ── Neo4j (Knowledge Base graph) ───────────────────────────
+# Paste the credentials Neo4j Aura gives you when the instance is created
+NEO4J_URI=neo4j+s://xxxxxxxx.databases.neo4j.io
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your_neo4j_password_or_api_key
+NEO4J_DATABASE=neo4j
+# NEO4J_ENABLED=false   # hard-disable KB grounding + knowledge writes
 
 # ── GitLab OAuth ────────────────────────────────────────────
 GITLAB_CLIENT_ID=your_gitlab_oauth_client_id
@@ -365,9 +377,9 @@ docker run -p 8000:8000 --env-file backend/.env axolotl-backend
 
 Simply push a commit with a CI failure to any watched GitLab (or Bitbucket) project. Axolotl will automatically:
 1. Receive the pipeline webhook and fetch logs via MCP
-2. Run the eight-stage LangGraph agent with artifact contracts (workspace → requirements → architecture → tasks → implement → validate → review). Analyst/Tech Lead use Gemini Flash; Architect/Developer/Evaluator use Gemini Pro.
-3. Apply Git Operations via MCP (branch, commit, merge request)
-4. Wait for human approval on the MR
+2. Run the eight-stage LangGraph agent with artifact contracts and Knowledge Base grounding (workspace → requirements → architecture → tasks → implement → validate → review). The Developer emits SEARCH/REPLACE blocks against real repo file contents; the patch engine applies them with fuzzy matching and indentation preservation. Analyst/Tech Lead use Gemini Flash; Architect/Developer/Evaluator use Gemini Pro.
+3. Apply Git Operations via MCP (branch, **each** file update, merge request)
+4. Wait for human approval on the MR — on approve/merge, successful fixes are written asynchronously into the Knowledge Base for future grounding
 
 ### Personal-repo demo (no company admin access)
 
@@ -393,6 +405,47 @@ With `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` set, every LangGraph CI-fi
 - Metadata includes `flash_model` / `pro_model`
 
 Startup logs will print `[LangSmith] Tracing enabled → project=...` when configured correctly.
+
+### Search/Replace patch engine (code surgery)
+
+Stage 5 no longer regenerates whole files. The Developer Agent (Gemini Pro) fetches the **real file contents** from the repo (via the `get_file_contents` MCP tool) and emits Aider-style `SEARCH/REPLACE` blocks in a **single pass** — no extra formatting LLM call. The backend engine in `agents/patch_utils.py` then applies them:
+
+- **Middle-out search** — Stage 2 extracts `file:line` hints from the stack trace for free (regex, no LLM). The engine scans outward from that line using Levenshtein fuzzy matching, so the right spot is found first even in 2k+ line files, and duplicated code resolves to the occurrence nearest the failure.
+- **Relative indentation preservation** — the search block and the matched file lines describe the same code in two styles, giving a per-level whitespace mapping. Replace lines are rewritten through it, so an LLM that hallucinates 2-space indents into a tabs file cannot corrupt formatting.
+- **Rich diagnostic partial retries** — when a block fails to match, `difflib` finds the closest real lines and the agent asks the LLM to fix **only that block** ("N of M blocks applied successfully. Do not resend them."), keeping applied blocks cached. Unresolved failures surface to the Evaluator and the revision loop.
+
+Empty `search_block` creates a new file. Downstream stages are unchanged: applied blocks become full-content `file_patches` for Docker validation, code review, and the per-file MCP commits.
+
+### Knowledge Base (Neo4j)
+
+The Knowledge Base is a provenance graph in Neo4j that lets the agent reason across pipeline sessions. Nodes carry the shared `:KBNode` label plus a type label — `Entity` (touched files/dependencies), `Claim` (a diagnosed root cause), `Source` (pipeline logs), `Artifact` (the approved multi-file patch set), and `Run` (an agent execution). Relationships are `MENTIONS`, `SUPPORTS`, `CONTRADICTS`, `DERIVED_FROM`, and `SUPERSEDES`.
+
+The graph is used at two points:
+
+- **Read (grounding)** — during `requirements_analysis`, the current error signature is matched against `Claim` nodes through the `kb_claim_fulltext` index, and the newest non-superseded `Artifact` for each hit is injected into the analyst's context.
+- **Write (post-HITL)** — approving or merging an MR schedules an asynchronous write of `Run → Claim → Artifact → Entity` with full provenance. Earlier artifacts for the same claim get a `SUPERSEDES` edge, so history is preserved rather than overwritten.
+
+Schema (uniqueness constraint plus the full-text index) is provisioned automatically on startup. If `NEO4J_URI`/`NEO4J_PASSWORD` are unset or the instance is unreachable, the KB silently disables itself and the pipeline runs without grounding.
+
+Verify the connection with a write/read round-trip that cleans up after itself:
+
+```bash
+cd backend
+python -m scripts.verify_kb
+```
+
+Inspect what the agent has learned in Neo4j Browser:
+
+```cypher
+// Claims and the fix currently backing them
+MATCH (c:Claim)-[:SUPPORTS]->(a:Artifact)
+WHERE NOT EXISTS { (:Artifact)-[:SUPERSEDES]->(a) }
+RETURN c.label AS root_cause, a.commit_message AS fix, a.pipeline_id AS pipeline;
+
+// Full provenance for one project
+MATCH (n:KBNode {project_id: '<project_id>'})-[r]->(m:KBNode)
+RETURN n, r, m;
+```
 
 ### Watching the Live Dashboard
 
@@ -668,10 +721,14 @@ axolotl/
 │   ├── agents/                       # AI Agent layer
 │   │   ├── base_agent.py             # Abstract BaseAgent interface
 │   │   ├── ci_fix_agent.py           # Facade: LangGraph (default) or legacy Gemini
-│   │   ├── langgraph_ci_fix_agent.py # 8-stage artifact contracts (Flash/Pro personas)
+│   │   ├── langgraph_ci_fix_agent.py # 8-stage artifact contracts (Flash/Pro, multi-file, KB grounding)
+│   │   ├── knowledge_schema.py       # KB node/edge types
+│   │   ├── knowledge_store.py        # Neo4j KB graph store (Cypher)
+│   │   ├── knowledge_extraction.py   # Post-HITL KB write
+│   │   ├── patch_utils.py            # Search/Replace engine: middle-out fuzzy match, reindent, diagnostics
 │   │   ├── langsmith_tracing.py      # LangSmith env + run config helpers
 │   │   ├── sandbox_tools.py          # Ephemeral Docker validation helpers
-│   │   ├── ci_fix_state.py           # CIFixState + ArchitecturePlan/CritiqueResult
+│   │   ├── ci_fix_state.py           # CIFixState + FilePatch/ArchitecturePlan/CritiqueResult
 │   │   └── prompt_builder.py         # Prompt engineering for CI logs
 │   ├── sandbox/                      # axolotl-validator Docker image
 │   │   ├── Dockerfile
@@ -706,7 +763,8 @@ axolotl/
 │   │   └── dependencies.py           # Orchestrator singleton factory
 │   │
 │   ├── db/                           # Data persistence
-│   │   └── mongo_service.py          # MongoDBService: users, projects, events, metrics
+│   │   ├── mongo_service.py          # MongoDBService: users, projects, events, metrics
+│   │   └── neo4j_service.py          # Neo4jService: KB graph driver + schema
 │   │
 │   ├── observability/                # Pluggable tracing
 │   │   ├── base_observability.py     # Abstract observability interface

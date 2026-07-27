@@ -303,6 +303,11 @@ async def approve_merge_request(
         raise HTTPException(status_code=403, detail="Not authorized to approve")
     resp.raise_for_status()
 
+    # Post-HITL: async KB write (does not block the API response)
+    from agents.knowledge_extraction import schedule_kb_extraction
+
+    schedule_kb_extraction(project_id, mr_iid)
+
     return {"status": "approved", "mr_iid": mr_iid}
 
 
@@ -333,6 +338,10 @@ async def merge_merge_request(
     if resp.status_code == 405:
         raise HTTPException(status_code=405, detail="Cannot be merged")
     resp.raise_for_status()
+
+    from agents.knowledge_extraction import schedule_kb_extraction
+
+    schedule_kb_extraction(project_id, mr_iid)
 
     return {"status": "merged", "mr_iid": mr_iid}
 
