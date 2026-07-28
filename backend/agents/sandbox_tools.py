@@ -7,6 +7,7 @@ named container). Commands are allowlisted to avoid shell injection.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -15,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 from langsmith import traceable
 
 VALIDATOR_IMAGE = os.getenv("CI_FIX_VALIDATOR_IMAGE", "axolotl-validator")
@@ -22,6 +25,8 @@ WORKSPACE_ROOT = Path(
     os.getenv("CI_FIX_WORKSPACE_ROOT", "")
     or (Path(tempfile.gettempdir()) / "axolotl-sandbox")
 )
+# Resolve the sandbox directory (contains Dockerfile) relative to this file.
+_SANDBOX_DIR = Path(__file__).resolve().parent.parent / "sandbox"
 
 # Safe relative path: no absolute paths, no .. traversal
 _SAFE_REL_PATH = re.compile(r"^(?!/)(?!.*\.\.(?:/|$))[A-Za-z0-9_./\-]+$")
@@ -44,6 +49,47 @@ def _docker_available() -> bool:
         client.ping()
         return True
     except Exception:
+        return False
+
+
+def _ensure_validator_image(client, image_name: str) -> bool:
+    """
+    Ensure the validator Docker image exists, building it automatically if missing.
+
+    Returns True if the image is available (pre-existing or freshly built),
+    False if the build failed or the Dockerfile is missing.
+    """
+    try:
+        client.images.get(image_name)
+        return True
+    except Exception:
+        pass  # Image not found, attempt auto-build below
+
+    dockerfile_path = _SANDBOX_DIR / "Dockerfile"
+    if not dockerfile_path.exists():
+        logger.warning(
+            "Cannot auto-build '%s': Dockerfile not found at %s",
+            image_name,
+            dockerfile_path,
+        )
+        return False
+
+    logger.info(
+        "Validator image '%s' not found — auto-building from %s ...",
+        image_name,
+        _SANDBOX_DIR,
+    )
+    try:
+        client.images.build(
+            path=str(_SANDBOX_DIR),
+            dockerfile="Dockerfile",
+            tag=image_name,
+            rm=True,
+        )
+        logger.info("Successfully built validator image '%s'.", image_name)
+        return True
+    except Exception as exc:
+        logger.error("Auto-build of '%s' failed: %s", image_name, exc)
         return False
 
 
@@ -144,6 +190,19 @@ def run_check(
     from docker.errors import ContainerError, ImageNotFound, APIError
 
     client = docker.from_env()
+
+    # Auto-build the validator image if it doesn't exist yet.
+    if not _ensure_validator_image(client, image_name):
+        return CheckResult(
+            passed=False,
+            output=(
+                f"Validator image '{image_name}' not found and auto-build failed. "
+                f"Build it manually with: docker build -t {image_name} "
+                f"-f backend/sandbox/Dockerfile backend/sandbox"
+            ),
+            command=command_display,
+        )
+
     host_path = str(workspace.resolve())
 
     # pip install needs network; compile/lint checks stay isolated.
@@ -170,15 +229,6 @@ def run_check(
         return CheckResult(
             passed=status == 0,
             output=logs_out.strip() or f"exit code {status}",
-            command=command_display,
-        )
-    except ImageNotFound:
-        return CheckResult(
-            passed=False,
-            output=(
-                f"Validator image '{image_name}' not found. "
-                f"Build it with: docker build -t {image_name} -f backend/sandbox/Dockerfile backend/sandbox"
-            ),
             command=command_display,
         )
     except ContainerError as exc:

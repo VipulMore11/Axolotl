@@ -68,11 +68,26 @@ class MongoDBService:
         await users_collection.create_index("gitlab_user_id", unique=True, sparse=True)
 
         # Multi-provider index: (provider, provider_user_id)
+        # Drop the old index BEFORE migration, otherwise adding 'provider' without 'provider_user_id' will trigger duplicate key errors
+        try:
+            existing_indexes = await users_collection.index_information()
+            if "provider_1_provider_user_id_1" in existing_indexes:
+                idx_info = existing_indexes["provider_1_provider_user_id_1"]
+                # Always drop the index if it was created with sparse or without partialFilterExpression
+                if "partialFilterExpression" not in idx_info:
+                    print("[INDEX] Dropping existing provider_1_provider_user_id_1 index to apply partialFilterExpression...")
+                    await users_collection.drop_index("provider_1_provider_user_id_1")
+        except Exception as e:
+            print(f"[INDEX] Warning checking provider compound index: {e}")
+
+        # Now perform migration so legacy user docs have provider_user_id populated
+        await self._migrate_provider_fields()
+
         try:
             await users_collection.create_index(
                 [("provider", 1), ("provider_user_id", 1)],
                 unique=True,
-                sparse=True,
+                partialFilterExpression={"provider_user_id": {"$type": "string"}},
             )
         except Exception as e:
             print(f"[INDEX] Warning creating compound index (may already exist): {e}")
@@ -83,9 +98,6 @@ class MongoDBService:
         pending = self.db["pending_fixes"]
         await pending.create_index([("project_id", 1), ("mr_iid", 1)])
         await pending.create_index("pipeline_id")
-
-        # ── Startup migration: backfill 'provider' on legacy documents ──
-        await self._migrate_provider_fields()
 
     # ============ Projects Collection Operations ============
 

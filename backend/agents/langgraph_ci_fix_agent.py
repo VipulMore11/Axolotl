@@ -147,10 +147,26 @@ guided by validation_failures and review revision_instructions."""
 
 def _persona_evaluator() -> str:
     return """You are the Evaluator Agent for Axolotl CI repair.
-Compare file_patches against root_cause and architecture_plan.
-Approve only if the patches are minimal, correct, and match the plan.
-If rejecting: issues MUST cite file paths and line numbers,
-and revision_instructions must be concrete actionable edits.
+Your job is to review ONLY the changes the Developer Agent made — NOT pre-existing code quality.
+
+Approval criteria (ALL must be true):
+1. The patch correctly addresses the diagnosed root cause.
+2. The patch matches the architecture plan's strategy and affected files.
+3. The patch does not introduce NEW bugs, syntax errors, or regressions.
+4. The patch is minimal — it changes only what is necessary to fix the CI failure.
+
+You MUST IGNORE:
+- Pre-existing unused imports, PEP8 issues, or code style problems that were
+  already present in the ORIGINAL file BEFORE the developer's patch.
+- Functions, classes, or logic that the developer did NOT touch.
+- Any issue visible in the original file diff context marked as ORIGINAL.
+
+A DIFF section is provided showing exactly what lines were added/removed.
+Only evaluate those changes. If the diff correctly fixes the root cause
+without introducing new problems, mark satisfactory=true.
+
+If rejecting: issues MUST cite file paths and line numbers of NEWLY
+introduced problems, and revision_instructions must be concrete actionable edits.
 Return CritiqueResult fields only."""
 
 
@@ -837,20 +853,54 @@ class LangGraphCIFixAgent(BaseAgent):
             "validation_failures": failures,
         }
 
+    @staticmethod
+    def _build_diff_summary(
+        file_path: str, original: str | None, patched: str
+    ) -> str:
+        """Build a unified-diff-style summary showing what the developer changed."""
+        import difflib
+
+        orig_lines = (original or "").splitlines(keepends=True)
+        patched_lines = patched.splitlines(keepends=True)
+        diff = difflib.unified_diff(
+            orig_lines,
+            patched_lines,
+            fromfile=f"ORIGINAL {file_path}",
+            tofile=f"PATCHED  {file_path}",
+            lineterm="",
+        )
+        diff_text = "\n".join(diff)
+        if not diff_text.strip():
+            return f"### {file_path}\n(no changes)"
+        return f"### {file_path}\n```diff\n{diff_text}\n```"
+
     async def _code_review(self, state: CIFixState) -> dict[str, Any]:
         plan = _plan_as_dict(state.get("architecture_plan"))
         history = list(state.get("review_history") or [])
         patches = _normalize_patches(state.get("file_patches"))
+        originals: dict[str, str | None] = dict(state.get("file_contents") or {})
         await self._emit(
             "code_review",
             "Evaluator (Pro): reviewing multi-file patches...",
             {"model": self.pro_model, "files": [p["file_path"] for p in patches]},
         )
 
+        # Build diff summaries showing exactly what the developer changed
+        diff_sections = []
+        for patch in patches:
+            path = patch["file_path"]
+            original = originals.get(path)
+            diff_sections.append(
+                self._build_diff_summary(path, original, patch["updated_content"])
+            )
+
+        # Also include numbered patched files for full context
         numbered_blocks = []
         for patch in patches:
             lines = patch["updated_content"].splitlines()
-            numbered = "\n".join(f"{i:4d}| {line}" for i, line in enumerate(lines, start=1))
+            numbered = "\n".join(
+                f"{i:4d}| {line}" for i, line in enumerate(lines, start=1)
+            )
             numbered_blocks.append(f"### {patch['file_path']}\n{numbered}")
 
         human = (
@@ -858,9 +908,18 @@ class LangGraphCIFixAgent(BaseAgent):
             f"ArchitecturePlan: {json.dumps(plan)}\n"
             f"Commit message: {state.get('commit_message')}\n"
             f"Validation output:\n{state.get('validation_output')}\n"
-            f"Unresolved patch-apply failures: {json.dumps(list(state.get('patch_failures') or []))}\n"
-            f"Patches (line-numbered):\n" + "\n\n".join(numbered_blocks) + "\n\n"
-            "Return CritiqueResult. If unsatisfactory, cite file:line in issues."
+            f"Unresolved patch-apply failures: {json.dumps(list(state.get('patch_failures') or []))}\n\n"
+            "═══ DIFF (what the developer ACTUALLY changed) ═══\n"
+            + "\n\n".join(diff_sections)
+            + "\n\n═══ FULL PATCHED FILES (for reference) ═══\n"
+            + "\n\n".join(numbered_blocks)
+            + "\n\n"
+            "IMPORTANT: Review ONLY the changes shown in the DIFF section above.\n"
+            "Do NOT reject for pre-existing issues (unused imports, PEP8 style, "
+            "unrelated functions) that appear in the ORIGINAL file and were NOT "
+            "introduced by the developer's patch.\n"
+            "Approve if the diff correctly fixes the root cause without introducing "
+            "new bugs. Return CritiqueResult."
         )
         structured = self.llm_pro.with_structured_output(CritiqueResultModel)
         try:
