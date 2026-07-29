@@ -271,6 +271,93 @@ class GitLabMCPClient:
             traceback.print_exc()
             return None
 
+    async def search_code(
+        self,
+        project_id: str,
+        branch: str,
+        patterns: list,
+        max_files: int = 200,
+        max_matches: int = 50,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fan-out search: walk the repository tree and return files whose contents
+        contain any of the given literal patterns (same-error sibling discovery).
+        """
+        print(
+            f"[DEBUG] search_code called | project_id={project_id} | branch={branch} "
+            f"| patterns={patterns[:5]} | max_files={max_files}"
+        )
+        if not patterns:
+            return {"matches": [], "files": [], "scanned": 0}
+
+        client = await self._get_or_create_client(project_id)
+        if not client:
+            return None
+
+        try:
+            from agents.error_signature import content_matches_patterns, is_searchable_path
+        except Exception:
+            # Fallback if import path differs when run as MCP subprocess
+            import sys
+            from pathlib import Path
+
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from agents.error_signature import content_matches_patterns, is_searchable_path
+
+        try:
+            project = client.projects.get(project_id)
+            tree = project.repository_tree(ref=branch, recursive=True, all=True) or []
+            blob_paths = [
+                item["path"]
+                for item in tree
+                if item.get("type") == "blob" and is_searchable_path(str(item.get("path") or ""))
+            ][: max(1, int(max_files))]
+
+            matches: list[Dict[str, Any]] = []
+            files_hit: list[str] = []
+            scanned = 0
+            for path in blob_paths:
+                if len(matches) >= max_matches:
+                    break
+                try:
+                    file_obj = project.files.get(path, ref=branch)
+                    content = file_obj.decode().decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                scanned += 1
+                hits = content_matches_patterns(content, [str(p) for p in patterns if p])
+                if hits:
+                    files_hit.append(path)
+                    matches.append(
+                        {
+                            "file_path": path,
+                            "patterns": hits[:5],
+                            "snippet": next(
+                                (
+                                    line.strip()
+                                    for line in content.splitlines()
+                                    if any(h in line for h in hits)
+                                ),
+                                hits[0],
+                            )[:200],
+                        }
+                    )
+
+            print(
+                f"[DEBUG] search_code done | scanned={scanned} | hits={len(files_hit)}"
+            )
+            return {
+                "matches": matches,
+                "files": files_hit,
+                "scanned": scanned,
+                "branch": branch,
+            }
+        except Exception as e:
+            print(f"[ERROR] search_code failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     async def get_file_contents(
         self, project_id: str, branch: str, file_path: str
     ) -> Optional[Dict[str, Any]]:

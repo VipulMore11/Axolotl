@@ -4,6 +4,7 @@ export type AgentStageKey =
   | "workspace-setup"
   | "requirements-analysis"
   | "technical-architecture"
+  | "error-expansion"
   | "task-breakdown"
   | "code-implementation"
   | "testing-validation"
@@ -75,6 +76,13 @@ export const agentStages: AgentStage[] = [
     description: "Strategy: single-file dependency / code patch",
     state: "done",
     durationMs: 3100,
+  },
+  {
+    key: "error-expansion",
+    label: "Error Expansion",
+    description: "Same-error fan-out across sibling files",
+    state: "done",
+    durationMs: 1800,
   },
   {
     key: "task-breakdown",

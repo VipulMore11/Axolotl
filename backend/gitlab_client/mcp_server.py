@@ -106,6 +106,40 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="search_code",
+            description=(
+                "Search repository file contents for literal patterns. Used to find "
+                "sibling files that share the same CI error signature (fan-out)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "GitLab project ID"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch or ref to search"
+                    },
+                    "patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Literal substrings to find in file contents"
+                    },
+                    "max_files": {
+                        "type": "integer",
+                        "description": "Max files to open while scanning (default 200)"
+                    },
+                    "max_matches": {
+                        "type": "integer",
+                        "description": "Stop after this many matching files (default 50)"
+                    }
+                },
+                "required": ["project_id", "branch", "patterns"]
+            }
+        ),
+        Tool(
             name="update_file",
             description="Update or create a file and commit the changes.",
             inputSchema={
@@ -252,6 +286,33 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
             else:
                 return CallToolResult(
                     content=[TextContent(type="text", text="get_file_contents returned None — check GitLab auth and project config")],
+                    isError=True
+                )
+
+        elif name == "search_code":
+            try:
+                result = await gitlab_client.search_code(
+                    arguments["project_id"],
+                    arguments["branch"],
+                    list(arguments.get("patterns") or []),
+                    max_files=int(arguments.get("max_files") or 200),
+                    max_matches=int(arguments.get("max_matches") or 50),
+                )
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"search_code exception: {e}\n{tb}")],
+                    isError=True
+                )
+            if result is not None:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=json.dumps(result, indent=2))],
+                    isError=False
+                )
+            else:
+                return CallToolResult(
+                    content=[TextContent(type="text", text="search_code returned None — check GitLab auth and project config")],
                     isError=True
                 )
 

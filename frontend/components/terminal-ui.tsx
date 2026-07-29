@@ -24,6 +24,7 @@ const eventTypeToLine: Record<string, Line["type"]> = {
   workspace_setup: "out",
   requirements_analysis: "out",
   technical_architecture: "out",
+  error_expansion: "out",
   task_breakdown: "out",
   code_implementation: "out",
   testing_validation: "out",

@@ -235,6 +235,7 @@ class PipelineOrchestrator:
                     "workspace_setup": EventType.WORKSPACE_SETUP,
                     "requirements_analysis": EventType.REQUIREMENTS_ANALYSIS,
                     "technical_architecture": EventType.TECHNICAL_ARCHITECTURE,
+                    "error_expansion": EventType.ERROR_EXPANSION,
                     "task_breakdown": EventType.TASK_BREAKDOWN,
                     "code_implementation": EventType.CODE_IMPLEMENTATION,
                     "testing_validation": EventType.TESTING_VALIDATION,
@@ -275,6 +276,26 @@ class PipelineOrchestrator:
                 if hasattr(self.ci_fix_agent, "set_file_fetcher"):
                     self.ci_fix_agent.set_file_fetcher(fetch_file)
 
+                async def search_code(patterns: list) -> list:
+                    result = await self._call_mcp_tool(session, "search_code", {
+                        "project_id": project_id,
+                        "branch": branch,
+                        "patterns": list(patterns or []),
+                        "max_files": 200,
+                        "max_matches": 50,
+                    })
+                    if not result:
+                        return []
+                    files = result.get("files") or [
+                        m.get("file_path")
+                        for m in (result.get("matches") or [])
+                        if isinstance(m, dict) and m.get("file_path")
+                    ]
+                    return [str(p) for p in files if p]
+
+                if hasattr(self.ci_fix_agent, "set_code_searcher"):
+                    self.ci_fix_agent.set_code_searcher(search_code)
+
                 failure = PipelineFailure(
                     project_id=project_id,
                     pipeline_id=pipeline_id,
@@ -299,6 +320,8 @@ class PipelineOrchestrator:
                         self.ci_fix_agent.set_on_stage(None)
                     if hasattr(self.ci_fix_agent, "set_file_fetcher"):
                         self.ci_fix_agent.set_file_fetcher(None)
+                    if hasattr(self.ci_fix_agent, "set_code_searcher"):
+                        self.ci_fix_agent.set_code_searcher(None)
 
                 # Log the agent trace for observability
                 if self.event_publisher and self.event_publisher.observability:

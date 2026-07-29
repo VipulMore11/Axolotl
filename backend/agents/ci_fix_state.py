@@ -45,6 +45,18 @@ def empty_architecture_plan() -> ArchitecturePlan:
     }
 
 
+class ErrorSignatureState(TypedDict, total=False):
+    """Searchable seed derived from CI logs for same-error fan-out."""
+
+    error_class: str
+    module_name: str
+    lint_codes: list[str]
+    seed_files: list[str]
+    seed_lines: dict[str, int]
+    patterns: list[str]
+    notes: str
+
+
 class CIFixState(TypedDict):
     """Explicit workspace + artifact state for the CI fix graph."""
 
@@ -52,10 +64,14 @@ class CIFixState(TypedDict):
     project_id: str
     pipeline_id: str
     branch: str
-    logs: str
+    logs: str  # full raw CI logs (regex tooling / fan-out)
+    logs_digest: str  # LLM-facing compressed failure digest
+    relevant_errors: list[str]  # discrete error blocks from the reducer
     root_cause: str
     line_hints: dict[str, int]  # file_path -> failing line from the stack trace
+    error_signature: ErrorSignatureState
     architecture_plan: ArchitecturePlan
+    expanded_files: list[str]  # seed + repo fan-out siblings
     task_breakdown: list[str]
     file_contents: dict[str, str]  # original repo contents fetched for patching
     search_replace_blocks: list[SearchReplaceBlock]

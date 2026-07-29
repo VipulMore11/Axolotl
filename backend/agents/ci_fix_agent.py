@@ -19,6 +19,7 @@ from google import genai
 from agents.base_agent import BaseAgent
 from agents.exceptions import CIFixAgentError
 from agents.prompt_builder import PromptBuilder
+from agents.log_reducer import reduce_ci_logs
 from schemas.fix import FixProposal
 from schemas.pipeline import PipelineFailure
 
@@ -46,7 +47,8 @@ class LegacyCIFixAgent(BaseAgent):
             f"| pipeline_id={failure.pipeline_id}"
         )
         try:
-            prompt = PromptBuilder.build_prompt(failure)
+            digest = reduce_ci_logs(failure.logs).get("digest") or failure.logs
+            prompt = PromptBuilder.build_prompt(failure, logs=digest)
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model=self.model,
@@ -117,6 +119,11 @@ class CIFixAgent(BaseAgent):
         """Attach a repo file reader used by the search/replace patch engine."""
         if hasattr(self._impl, "set_file_fetcher"):
             self._impl.set_file_fetcher(fetcher)
+
+    def set_code_searcher(self, searcher) -> None:
+        """Attach a repo pattern searcher used by same-error fan-out."""
+        if hasattr(self._impl, "set_code_searcher"):
+            self._impl.set_code_searcher(searcher)
 
     @override
     async def analyze(self, failure: PipelineFailure) -> FixProposal:

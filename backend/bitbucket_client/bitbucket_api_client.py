@@ -234,6 +234,123 @@ class BitbucketAPIClient:
             traceback.print_exc()
             return None
 
+    async def search_code(
+        self,
+        project_id: str,
+        branch: str,
+        patterns: list,
+        max_files: int = 200,
+        max_matches: int = 50,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fan-out search over Bitbucket src tree for literal pattern matches.
+        """
+        print(
+            f"[DEBUG] search_code called | project_id={project_id} | branch={branch} "
+            f"| patterns={patterns[:5]} | max_files={max_files}"
+        )
+        if not patterns:
+            return {"matches": [], "files": [], "scanned": 0}
+
+        repo_path = await self._get_repo_path(project_id)
+
+        try:
+            from agents.error_signature import content_matches_patterns, is_searchable_path
+        except Exception:
+            import sys
+            from pathlib import Path
+
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from agents.error_signature import content_matches_patterns, is_searchable_path
+
+        clean_patterns = [str(p) for p in patterns if p]
+
+        async def _list_dir(client: httpx.AsyncClient, prefix: str) -> list[dict]:
+            url = f"{self.BASE_URL}/repositories/{repo_path}/src/{branch}/{prefix}".rstrip("/")
+            if prefix and not url.endswith("/"):
+                url += "/"
+            resp = await client.get(url, params={"pagelen": 100, "max_depth": 1})
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+            return list(data.get("values") or [])
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, auth=self._auth) as client:
+                # BFS over directories to collect blob paths
+                queue: list[str] = [""]
+                blob_paths: list[str] = []
+                seen_dirs: set[str] = set()
+                while queue and len(blob_paths) < max_files:
+                    prefix = queue.pop(0)
+                    if prefix in seen_dirs:
+                        continue
+                    seen_dirs.add(prefix)
+                    try:
+                        entries = await _list_dir(client, prefix)
+                    except Exception:
+                        continue
+                    for entry in entries:
+                        path = str(entry.get("path") or "").lstrip("/")
+                        etype = entry.get("type")
+                        if etype == "commit_directory":
+                            if path and is_searchable_path(path + "/file.py"):
+                                # directory itself — enqueue unless skipped by prefix rules
+                                pass
+                            queue.append(path)
+                        elif etype == "commit_file" and is_searchable_path(path):
+                            blob_paths.append(path)
+                            if len(blob_paths) >= max_files:
+                                break
+
+                matches: list[Dict[str, Any]] = []
+                files_hit: list[str] = []
+                scanned = 0
+                for path in blob_paths:
+                    if len(matches) >= max_matches:
+                        break
+                    resp = await client.get(
+                        f"{self.BASE_URL}/repositories/{repo_path}/src/{branch}/{path}",
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    content = resp.text
+                    scanned += 1
+                    hits = content_matches_patterns(content, clean_patterns)
+                    if hits:
+                        files_hit.append(path)
+                        matches.append(
+                            {
+                                "file_path": path,
+                                "patterns": hits[:5],
+                                "snippet": next(
+                                    (
+                                        line.strip()
+                                        for line in content.splitlines()
+                                        if any(h in line for h in hits)
+                                    ),
+                                    hits[0],
+                                )[:200],
+                            }
+                        )
+
+                print(
+                    f"[DEBUG] search_code done | scanned={scanned} | hits={len(files_hit)}"
+                )
+                return {
+                    "matches": matches,
+                    "files": files_hit,
+                    "scanned": scanned,
+                    "branch": branch,
+                }
+
+        except Exception as e:
+            print(f"[ERROR] search_code failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     async def get_file_contents(
         self, project_id: str, branch: str, file_path: str
     ) -> Optional[Dict[str, Any]]:

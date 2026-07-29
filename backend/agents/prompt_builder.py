@@ -5,8 +5,13 @@ class PromptBuilder:
     """Builds structured prompts for Gemini-based CI fix analysis."""
 
     @staticmethod
-    def build_prompt(failure: PipelineFailure) -> str:
-        """Create a JSON-focused prompt for Gemini using the failed pipeline data."""
+    def build_prompt(failure: PipelineFailure, logs: str | None = None) -> str:
+        """
+        Create a JSON-focused prompt for Gemini using the failed pipeline data.
+
+        Prefer passing a pre-reduced `logs` digest; falls back to failure.logs.
+        """
+        log_text = logs if logs is not None else failure.logs
         return f"""
 You are an expert CI/CD analyzer for a Python project.
 Analyze the following pipeline failure and return ONLY valid JSON with these exact keys:
@@ -21,10 +26,11 @@ Use these MVP rules:
 3. If the logs mention lint, flake8, or ruff, suggest applying patches to the affected files.
 4. Prefer minimal multi-file edits when required; keep changes practical.
 5. Keep the output concise.
+6. Trust the provided log digest — it already filters CI noise; do not invent failures not present in it.
 
 Project ID: {failure.project_id}
 Pipeline ID: {failure.pipeline_id}
 Branch: {failure.branch}
-Logs:
-{failure.logs}
+Relevant CI errors (compressed digest):
+{log_text}
 """.strip()

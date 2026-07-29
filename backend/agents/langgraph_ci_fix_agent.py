@@ -32,8 +32,14 @@ from agents.ci_fix_state import (
     empty_architecture_plan,
 )
 from agents.exceptions import CIFixAgentError
+from agents.error_signature import (
+    extract_error_signature,
+    merge_affected_files,
+    remaining_signature_hits,
+)
 from agents.knowledge_store import get_knowledge_store
 from agents.langsmith_tracing import build_run_config, configure_langsmith
+from agents.log_reducer import logs_for_llm, reduce_ci_logs
 from agents.patch_utils import (
     DEFAULT_FUZZY_THRESHOLD,
     apply_blocks,
@@ -119,13 +125,18 @@ def _persona_architect() -> str:
     return """You are the Architect Agent for Axolotl CI repair.
 Design a low-blast-radius fix. strategy_type must be one of: deps, lint, format, code_patch.
 List ALL affected_files that need modification (multi-file allowed when necessary).
-Prefer requirements.txt for missing modules. Return ArchitecturePlan fields only."""
+Prefer requirements.txt for missing modules.
+IMPORTANT: CI logs are often fail-fast and may only name ONE broken file. Still list every
+file you can infer from the logs/stack traces. A later error_expansion stage will search
+the repo for siblings with the same signature and enlarge this list.
+Return ArchitecturePlan fields only."""
 
 
 def _persona_tech_lead() -> str:
     return """You are the Tech Lead Agent for Axolotl CI repair.
 Turn the ArchitecturePlan into an ordered, dependency-aware checklist (3-6 short steps).
-Do not write code. Return only task_breakdown as a list of strings."""
+If expanded_files lists siblings beyond the seed failure, include a step to fix ALL of them
+in the same change set. Do not write code. Return only task_breakdown as a list of strings."""
 
 
 def _persona_developer() -> str:
@@ -138,6 +149,8 @@ Strict rules:
 3. Multiple blocks per file are allowed; they apply top to bottom.
 4. To create a NEW file, use an empty search_block and put the full contents in replace_block.
 5. Never put line-number prefixes or markdown fences inside blocks.
+6. If multiple files share the SAME error signature, emit blocks for EVERY listed file —
+   do not stop after fixing the seed file from the CI log.
 Fix guidance:
 - ModuleNotFoundError → add the dependency to requirements.txt (imports only if required)
 - black/ruff format or lint errors → patch only the offending lines
@@ -242,6 +255,9 @@ class LangGraphCIFixAgent(BaseAgent):
 
         self.on_stage = on_stage
         self.file_fetcher: Optional[Callable[[str], Awaitable[Optional[str]] | Optional[str]]] = None
+        self.code_searcher: Optional[
+            Callable[[list[str]], Awaitable[list[str]] | list[str]]
+        ] = None
         self.langsmith_enabled = configure_langsmith()
         self.validate_enabled = _env_bool("CI_FIX_VALIDATE", True)
         self.max_attempts = _max_attempts()
@@ -255,6 +271,12 @@ class LangGraphCIFixAgent(BaseAgent):
             )
         except ValueError:
             self.fuzzy_threshold = DEFAULT_FUZZY_THRESHOLD
+        try:
+            self.expansion_max_files = max(
+                1, int(os.getenv("CI_FIX_EXPANSION_MAX_FILES", "25"))
+            )
+        except ValueError:
+            self.expansion_max_files = 25
         self.flash_model = _flash_model()
         self.pro_model = _pro_model()
         self.llm_flash = ChatGoogleGenerativeAI(
@@ -272,6 +294,10 @@ class LangGraphCIFixAgent(BaseAgent):
         """Attach a callable(file_path) -> str|None that reads repo files (MCP-backed)."""
         self.file_fetcher = fetcher
 
+    def set_code_searcher(self, searcher) -> None:
+        """Attach a callable(patterns) -> list[file_path] for same-error fan-out."""
+        self.code_searcher = searcher
+
     async def _fetch_original(self, file_path: str) -> Optional[str]:
         """Fetch original repo contents for a file; None when missing/unavailable."""
         if self.file_fetcher is None:
@@ -285,6 +311,21 @@ class LangGraphCIFixAgent(BaseAgent):
             print(f"[PatchEngine] Failed to fetch {file_path}: {exc}")
             return None
 
+    async def _search_siblings(self, patterns: list[str]) -> list[str]:
+        """Run the injected repo searcher; empty when unavailable."""
+        if self.code_searcher is None or not patterns:
+            return []
+        try:
+            result = self.code_searcher(patterns)
+            if inspect.isawaitable(result):
+                result = await result
+            if not result:
+                return []
+            return [normalize_patch_path(str(p)) for p in result if p]
+        except Exception as exc:
+            print(f"[ErrorExpansion] Repo search failed: {exc}")
+            return []
+
     async def _emit(self, stage: str, message: str, metadata: Optional[dict] = None) -> None:
         if not self.on_stage:
             return
@@ -297,6 +338,7 @@ class LangGraphCIFixAgent(BaseAgent):
         workflow.add_node("workspace_setup", self._workspace_setup)
         workflow.add_node("requirements_analysis", self._requirements_analysis)
         workflow.add_node("technical_architecture", self._technical_architecture)
+        workflow.add_node("error_expansion", self._error_expansion)
         workflow.add_node("task_breakdown", self._task_breakdown)
         workflow.add_node("code_implementation", self._code_implementation)
         workflow.add_node("testing_validation", self._testing_validation)
@@ -305,7 +347,8 @@ class LangGraphCIFixAgent(BaseAgent):
         workflow.add_edge(START, "workspace_setup")
         workflow.add_edge("workspace_setup", "requirements_analysis")
         workflow.add_edge("requirements_analysis", "technical_architecture")
-        workflow.add_edge("technical_architecture", "task_breakdown")
+        workflow.add_edge("technical_architecture", "error_expansion")
+        workflow.add_edge("error_expansion", "task_breakdown")
         workflow.add_edge("task_breakdown", "code_implementation")
         workflow.add_edge("code_implementation", "testing_validation")
         workflow.add_conditional_edges(
@@ -331,11 +374,41 @@ class LangGraphCIFixAgent(BaseAgent):
             {"pipeline_id": state["pipeline_id"], "branch": state["branch"]},
         )
         reset_workspace(state["pipeline_id"])
+
+        # Compress CI logs once up front — LLMs see the digest; regex tools keep raw.
+        reduced = reduce_ci_logs(state.get("logs") or "")
+        digest = str(reduced.get("digest") or "")
+        relevant = list(reduced.get("relevant_errors") or [])
+        ratio = float(reduced.get("compression_ratio") or 1.0)
+        await self._emit(
+            "workspace_setup",
+            (
+                f"CI log digest ready: {reduced.get('raw_chars', 0)} → "
+                f"{reduced.get('digest_chars', 0)} chars "
+                f"({ratio:.0%} kept, {len(relevant)} error block(s), "
+                f"strategy={reduced.get('strategy')})"
+            ),
+            {
+                "raw_chars": reduced.get("raw_chars"),
+                "digest_chars": reduced.get("digest_chars"),
+                "compression_ratio": ratio,
+                "relevant_error_count": len(relevant),
+                "strategy": reduced.get("strategy"),
+            },
+        )
+
         seed = (
             f"Workspace ready.\nProject: {state['project_id']}\n"
-            f"Pipeline: {state['pipeline_id']}\nBranch: {state['branch']}"
+            f"Pipeline: {state['pipeline_id']}\nBranch: {state['branch']}\n"
+            f"Log digest: {reduced.get('digest_chars', 0)} chars "
+            f"(from {reduced.get('raw_chars', 0)} raw)"
         )
-        return {"current_stage": "workspace_setup", "messages": [SystemMessage(content=seed)]}
+        return {
+            "current_stage": "workspace_setup",
+            "logs_digest": digest,
+            "relevant_errors": relevant,
+            "messages": [SystemMessage(content=seed)],
+        }
 
     async def _requirements_analysis(self, state: CIFixState) -> dict[str, Any]:
         await self._emit(
@@ -345,11 +418,12 @@ class LangGraphCIFixAgent(BaseAgent):
         )
 
         kb_grounding = ""
+        digest = logs_for_llm(state)
         try:
             store = get_knowledge_store()
             historical = await store.find_historical_fixes(
                 project_id=state["project_id"],
-                error_text=state.get("logs") or "",
+                error_text=digest or (state.get("logs") or ""),
                 limit=3,
             )
             if historical:
@@ -376,8 +450,9 @@ class LangGraphCIFixAgent(BaseAgent):
                 project_id=state["project_id"],
                 pipeline_id=state["pipeline_id"],
                 branch=state["branch"],
-                logs=state["logs"],
-            )
+                logs=digest,
+            ),
+            logs=digest,
         )
         human = (
             f"{prompt}\n\n"
@@ -428,7 +503,7 @@ class LangGraphCIFixAgent(BaseAgent):
         human = (
             f"Root cause: {state.get('root_cause')}\n"
             f"KB grounding:\n{state.get('kb_grounding') or '(none)'}\n"
-            f"Logs (excerpt):\n{(state.get('logs') or '')[:4000]}\n\n"
+            f"Relevant CI errors (digest):\n{logs_for_llm(state)}\n\n"
             "Produce ArchitecturePlan JSON. List every affected file."
         )
         structured = self.llm_pro.with_structured_output(ArchitecturePlanModel)
@@ -469,8 +544,98 @@ class LangGraphCIFixAgent(BaseAgent):
             "messages": [HumanMessage(content=human)],
         }
 
+    async def _error_expansion(self, state: CIFixState) -> dict[str, Any]:
+        """Fan out from the CI seed error to sibling files with the same signature."""
+        plan = _plan_as_dict(state.get("architecture_plan"))
+        hints = dict(state.get("line_hints") or {})
+        signature = extract_error_signature(
+            state.get("logs") or "",
+            root_cause=str(state.get("root_cause") or ""),
+            line_hints=hints,
+        )
+        patterns = list(signature.get("patterns") or [])
+
+        await self._emit(
+            "error_expansion",
+            (
+                f"Expanding error signature [{signature.get('error_class')}] "
+                f"across the repository ({len(patterns)} pattern(s))..."
+            ),
+            {
+                "error_class": signature.get("error_class"),
+                "patterns": patterns[:8],
+                "seed_files": signature.get("seed_files") or [],
+            },
+        )
+
+        discovered = await self._search_siblings(patterns)
+        # Also include seed files from stack traces even if search is empty
+        discovered = list(
+            dict.fromkeys(
+                [normalize_patch_path(p) for p in (signature.get("seed_files") or [])]
+                + discovered
+            )
+        )
+
+        # Local content scan fallback: if searcher returned nothing but we already
+        # fetched some files, still keep planned + seed paths.
+        expanded = merge_affected_files(
+            list(plan.get("affected_files") or []),
+            discovered,
+            error_class=str(signature.get("error_class") or "unknown"),
+            max_files=self.expansion_max_files,
+        )
+
+        # Prefer deps file presence for ModuleNotFound even when not in plan
+        if signature.get("error_class") == "deps":
+            for dep_path in ("requirements.txt", "pyproject.toml"):
+                if dep_path not in expanded:
+                    content = await self._fetch_original(dep_path)
+                    if content is not None:
+                        expanded = merge_affected_files(
+                            expanded,
+                            [dep_path],
+                            error_class="deps",
+                            max_files=self.expansion_max_files,
+                        )
+
+        plan = {
+            **plan,
+            "affected_files": expanded,
+            "proposed_solution": (
+                f"{plan.get('proposed_solution') or ''} "
+                f"(expanded to {len(expanded)} file(s) via same-error fan-out)"
+            ).strip(),
+        }
+
+        new_siblings = [
+            p for p in expanded if p not in (signature.get("seed_files") or [])
+            and p not in (state.get("architecture_plan") or {}).get("affected_files", [])
+        ]
+        await self._emit(
+            "error_expansion",
+            (
+                f"Worklist: {len(expanded)} file(s)"
+                + (f" (+{len(new_siblings)} sibling hit(s) beyond the seed)" if new_siblings else "")
+                + f": {', '.join(expanded[:8])}"
+            ),
+            {
+                "expanded_files": expanded,
+                "discovered": discovered[:20],
+                "new_siblings": new_siblings[:20],
+                "error_signature": signature,
+            },
+        )
+        return {
+            "current_stage": "error_expansion",
+            "error_signature": signature,
+            "expanded_files": expanded,
+            "architecture_plan": plan,
+        }
+
     async def _task_breakdown(self, state: CIFixState) -> dict[str, Any]:
         plan = _plan_as_dict(state.get("architecture_plan"))
+        expanded = list(state.get("expanded_files") or plan.get("affected_files") or [])
         await self._emit(
             "task_breakdown",
             "Tech Lead (Flash): breaking plan into tasks...",
@@ -478,8 +643,11 @@ class LangGraphCIFixAgent(BaseAgent):
         )
         human = (
             f"Root cause: {state.get('root_cause')}\n"
-            f"ArchitecturePlan: {json.dumps(plan)}\n\n"
-            "Produce task_breakdown as an ordered list of 3-6 short strings."
+            f"ArchitecturePlan: {json.dumps(plan)}\n"
+            f"Expanded files (seed + same-error siblings): {json.dumps(expanded)}\n"
+            f"Error signature: {json.dumps(state.get('error_signature') or {})}\n\n"
+            "Produce task_breakdown as an ordered list of 3-6 short strings. "
+            "Include fixing EVERY expanded file when they share the same error."
         )
         structured = self.llm_flash.with_structured_output(TaskBreakdownResult)
         try:
@@ -569,9 +737,15 @@ class LangGraphCIFixAgent(BaseAgent):
         )
 
         # ── Gather real file contents (originals via MCP-backed fetcher) ──
+        expanded = [
+            normalize_patch_path(p)
+            for p in (state.get("expanded_files") or plan.get("affected_files") or [])
+            if p
+        ]
         target_files = list(
             dict.fromkeys(
                 [normalize_patch_path(p["file_path"]) for p in existing]
+                + expanded
                 + [normalize_patch_path(f) for f in (plan.get("affected_files") or [])]
             )
         )
@@ -596,12 +770,15 @@ class LangGraphCIFixAgent(BaseAgent):
         files_context = "\n\n".join(sections) or "(no file contents available)"
 
         tasks = state.get("task_breakdown") or []
+        signature = state.get("error_signature") or {}
         if is_revision:
             last_critique = history[-1] if history else None
             human = (
                 "TARGETED REVISION — emit SEARCH/REPLACE blocks ONLY for what must still change.\n"
                 f"Root cause: {state.get('root_cause')}\n"
                 f"ArchitecturePlan: {json.dumps(plan)}\n"
+                f"Expanded files: {json.dumps(expanded)}\n"
+                f"Error signature: {json.dumps(signature)}\n"
                 f"Tasks: {json.dumps(tasks)}\n"
                 f"validation_failures: {json.dumps(failures[-3:])}\n"
                 f"patch apply failures: {json.dumps(list(state.get('patch_failures') or [])[-3:])}\n"
@@ -609,7 +786,8 @@ class LangGraphCIFixAgent(BaseAgent):
                 "CURRENT FILE CONTENTS (your prior patches are already applied — "
                 "search blocks must match THIS text exactly):\n"
                 f"{files_context}\n\n"
-                "Return SearchReplaceProposal JSON: blocks + commit_message."
+                "Return SearchReplaceProposal JSON: blocks + commit_message. "
+                "Cover every expanded sibling that still has the error."
             )
         else:
             human = (
@@ -619,12 +797,15 @@ class LangGraphCIFixAgent(BaseAgent):
                 f"Root cause: {state.get('root_cause')}\n"
                 f"KB grounding:\n{state.get('kb_grounding') or '(none)'}\n"
                 f"ArchitecturePlan: {json.dumps(plan)}\n"
+                f"Expanded files (fix ALL of these if they share the error): {json.dumps(expanded)}\n"
+                f"Error signature: {json.dumps(signature)}\n"
                 f"Tasks: {json.dumps(tasks)}\n"
                 f"Failure line hints: {json.dumps(hints) or '(none)'}\n"
-                f"Logs (excerpt):\n{(state.get('logs') or '')[:6000]}\n\n"
+                f"Relevant CI errors (digest):\n{logs_for_llm(state)}\n\n"
                 "FILE CONTENTS (search blocks must match this text exactly):\n"
                 f"{files_context}\n\n"
-                "Return SearchReplaceProposal JSON: blocks + commit_message."
+                "Return SearchReplaceProposal JSON: blocks + commit_message. "
+                "Emit blocks for every expanded file that contains the error signature."
             )
 
         proposal = await self._invoke_search_replace(state, human)
@@ -802,13 +983,70 @@ class LangGraphCIFixAgent(BaseAgent):
         attempts = int(state.get("attempts") or 0) + 1
         failures = list(state.get("validation_failures") or [])
         patches = _normalize_patches(state.get("file_patches"))
+        signature = dict(state.get("error_signature") or {})
+        expanded = [
+            normalize_patch_path(p)
+            for p in (state.get("expanded_files") or [])
+            if p
+        ]
         await self._emit(
             "testing_validation",
             f"Validating {len(patches)} patch(es) in Docker (attempt {attempts})...",
             {"attempts": attempts, "files": [p["file_path"] for p in patches]},
         )
 
+        # Same-error leftover scan: patched + unpatched expanded siblings
+        from agents.error_signature import actionable_cleanup_patterns
+
+        cleanup_patterns = actionable_cleanup_patterns(signature)  # type: ignore[arg-type]
+        patched_map = {
+            normalize_patch_path(p["file_path"]): p["updated_content"] for p in patches
+        }
+        baseline = dict(state.get("file_contents") or {})
+        scan_contents: dict[str, str] = {}
+        for path in expanded or list(patched_map.keys()):
+            if path in patched_map:
+                scan_contents[path] = patched_map[path]
+            elif path in baseline:
+                scan_contents[path] = str(baseline[path])
+            else:
+                fetched = await self._fetch_original(path)
+                if fetched is not None:
+                    scan_contents[path] = fetched
+
+        leftovers = remaining_signature_hits(
+            scan_contents,
+            cleanup_patterns,
+            patched_paths=set(patched_map.keys()),
+        )
+        # Only fail the loop for leftovers that still contain the bad seed and
+        # either were not patched or were patched incompletely.
+        leftover_msg = ""
+        if leftovers and cleanup_patterns:
+            details = "; ".join(
+                f"{item['file_path']} still has {item['patterns'][:2]}"
+                for item in leftovers[:8]
+            )
+            leftover_msg = (
+                "Same-error siblings still match the failure signature after this "
+                f"patch set: {details}. Emit SEARCH/REPLACE blocks for EVERY listed file."
+            )
+
         if not self.validate_enabled:
+            if leftover_msg:
+                failures = failures + [leftover_msg]
+                await self._emit(
+                    "testing_validation",
+                    leftover_msg[:400],
+                    {"passed": False, "leftovers": leftovers[:10]},
+                )
+                return {
+                    "current_stage": "testing_validation",
+                    "attempts": attempts,
+                    "validation_passed": False,
+                    "validation_output": leftover_msg,
+                    "validation_failures": failures,
+                }
             output = "Validation skipped (CI_FIX_VALIDATE=false)."
             await self._emit("testing_validation", output, {"passed": True})
             return {
@@ -820,7 +1058,7 @@ class LangGraphCIFixAgent(BaseAgent):
             }
 
         if not patches:
-            output = "No file_patches in proposal."
+            output = leftover_msg or "No file_patches in proposal."
             failures = failures + [output]
             await self._emit("testing_validation", output, {"passed": False})
             return {
@@ -837,18 +1075,27 @@ class LangGraphCIFixAgent(BaseAgent):
             logs=state.get("logs") or "",
         )
         output = f"$ {result.command}\n{result.output}"
+        passed = result.passed
         if not result.passed:
             failures = failures + [output[:2000]]
+        if leftover_msg:
+            passed = False
+            failures = failures + [leftover_msg]
+            output = f"{output}\n\n{leftover_msg}"
 
         await self._emit(
             "testing_validation",
-            f"Validation {'passed' if result.passed else 'failed'}: {result.output[:300]}",
-            {"passed": result.passed, "output": output[:1000]},
+            f"Validation {'passed' if passed else 'failed'}: {(leftover_msg or result.output)[:300]}",
+            {
+                "passed": passed,
+                "output": output[:1000],
+                "leftovers": leftovers[:10],
+            },
         )
         return {
             "current_stage": "testing_validation",
             "attempts": attempts,
-            "validation_passed": result.passed,
+            "validation_passed": passed,
             "validation_output": output,
             "validation_failures": failures,
         }
@@ -1004,9 +1251,13 @@ class LangGraphCIFixAgent(BaseAgent):
             "pipeline_id": failure.pipeline_id,
             "branch": failure.branch,
             "logs": failure.logs,
+            "logs_digest": "",
+            "relevant_errors": [],
             "root_cause": "",
             "line_hints": {},
+            "error_signature": {},
             "architecture_plan": empty_architecture_plan(),
+            "expanded_files": [],
             "task_breakdown": [],
             "file_contents": {},
             "search_replace_blocks": [],
@@ -1037,9 +1288,12 @@ class LangGraphCIFixAgent(BaseAgent):
             "kb-grounding",
             "search-replace",
             "patch-engine",
+            "error-expansion",
+            "log-digest",
             "workspace_setup",
             "requirements_analysis",
             "technical_architecture",
+            "error_expansion",
             "task_breakdown",
             "code_implementation",
             "testing_validation",

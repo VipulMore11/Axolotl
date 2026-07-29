@@ -287,6 +287,12 @@ CI_FIX_MAX_ATTEMPTS=3
 # ── Search/Replace patch engine ────────────────────────────
 # CI_FIX_BLOCK_RETRIES=2        # targeted retries per failed SEARCH block
 # CI_FIX_FUZZY_THRESHOLD=0.85   # min Levenshtein similarity for a fuzzy match
+# CI_FIX_EXPANSION_MAX_FILES=25 # max files after same-error fan-out
+
+# ── CI log digest (LLM-facing; raw logs kept for regex tools) ─
+# CI_FIX_LOG_DIGEST_CHARS=3500  # max chars sent to LLM personas
+# CI_FIX_LOG_TAIL_LINES=120     # failure-biased tail window
+# CI_FIX_LOG_MAX_BLOCKS=12      # max discrete error blocks in the digest
 
 # ── LangSmith (optional tracing for LangGraph runs) ───────
 LANGSMITH_TRACING=true
@@ -377,7 +383,7 @@ docker run -p 8000:8000 --env-file backend/.env axolotl-backend
 
 Simply push a commit with a CI failure to any watched GitLab (or Bitbucket) project. Axolotl will automatically:
 1. Receive the pipeline webhook and fetch logs via MCP
-2. Run the eight-stage LangGraph agent with artifact contracts and Knowledge Base grounding (workspace → requirements → architecture → tasks → implement → validate → review). The Developer emits SEARCH/REPLACE blocks against real repo file contents; the patch engine applies them with fuzzy matching and indentation preservation. Analyst/Tech Lead use Gemini Flash; Architect/Developer/Evaluator use Gemini Pro.
+2. Run the LangGraph agent with artifact contracts, Knowledge Base grounding, and same-error fan-out (workspace → requirements → architecture → **error expansion** → tasks → implement → validate → review). CI logs are treated as a seed; the agent searches the repo for sibling files sharing the failure signature so fail-fast pipelines still get a multi-file fix. The Developer emits SEARCH/REPLACE blocks against real repo file contents. Analyst/Tech Lead use Gemini Flash; Architect/Developer/Evaluator use Gemini Pro.
 3. Apply Git Operations via MCP (branch, **each** file update, merge request)
 4. Wait for human approval on the MR — on approve/merge, successful fixes are written asynchronously into the Knowledge Base for future grounding
 
@@ -398,13 +404,24 @@ Set `CI_FIX_ENGINE=legacy` only if you need the old one-shot Gemini path. Set `C
 With `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` set, every LangGraph CI-fix run appears in [smith.langchain.com](https://smith.langchain.com) under project `LANGSMITH_PROJECT` (default `axolotl-ci-fix`). You should see:
 
 - Parent run: `ci_fix_analyze` / `ci-fix-<pipeline_id>`
-- Graph nodes: `workspace_setup` → `requirements_analysis` → `technical_architecture` → `task_breakdown` → `code_implementation` → `testing_validation` → `code_review`
-- Artifacts in state: `ArchitecturePlan`, `task_breakdown[]`, `validation_failures[]`, `review_history[]` (`CritiqueResult`)
+- Graph nodes: `workspace_setup` → `requirements_analysis` → `technical_architecture` → `error_expansion` → `task_breakdown` → `code_implementation` → `testing_validation` → `code_review`
+- Artifacts in state: `ArchitecturePlan`, `error_signature`, `expanded_files[]`, `task_breakdown[]`, `validation_failures[]`, `review_history[]` (`CritiqueResult`)
 - Child tool span: `docker_validate_patch`
 - Revise loops back to `code_implementation` with **targeted** edits when validation or review fails (up to `CI_FIX_MAX_ATTEMPTS`)
 - Metadata includes `flash_model` / `pro_model`
 
 Startup logs will print `[LangSmith] Tracing enabled → project=...` when configured correctly.
+
+### CI log digest (custom reducer)
+
+Full job traces stay in `state.logs` for regex tooling (`line_hints`, `error_signature`, fan-out). Before any LLM call, `workspace_setup` runs a **deterministic** reducer (`agents/log_reducer.py`) that:
+
+1. Strips ANSI and drops pip/Docker/download noise  
+2. Extracts every traceback, pytest failure, lint finding, and error/summary line  
+3. Always keeps a failure-biased tail window (useful part of CI is usually at the end)  
+4. Packs the result into `logs_digest` / `relevant_errors` (default ~3.5k chars)
+
+Analyst, Architect, and Developer prompts use **only** the digest — so LangSmith traces no longer dump multi‑MB build diaries into the model. No Headroom/LLM summarizer: rules only, stable and testable.
 
 ### Search/Replace patch engine (code surgery)
 
@@ -415,6 +432,18 @@ Stage 5 no longer regenerates whole files. The Developer Agent (Gemini Pro) fetc
 - **Rich diagnostic partial retries** — when a block fails to match, `difflib` finds the closest real lines and the agent asks the LLM to fix **only that block** ("N of M blocks applied successfully. Do not resend them."), keeping applied blocks cached. Unresolved failures surface to the Evaluator and the revision loop.
 
 Empty `search_block` creates a new file. Downstream stages are unchanged: applied blocks become full-content `file_patches` for Docker validation, code review, and the per-file MCP commits.
+
+### Same-error fan-out (`error_expansion`)
+
+CI webhooks / job logs are often **fail-fast**: only the first broken file appears in the trace even when the same bug exists in other files. After the Architect drafts a plan, `error_expansion`:
+
+1. Builds an `error_signature` from the logs (module name, failing source line, lint codes, import snippets).
+2. Calls MCP `search_code` to scan the repository for those literal patterns.
+3. Merges hits into `expanded_files` / `architecture_plan.affected_files` (capped by `CI_FIX_EXPANSION_MAX_FILES`).
+4. Stage 5 is instructed to patch **every** expanded sibling, not just the seed file.
+5. Stage 6 re-checks that actionable signature patterns no longer remain in expanded files; leftovers force another implementation loop.
+
+Pure dependency fixes still prioritize `requirements.txt`, and legitimate `import <missing_module>` usages are not treated as leftover failures.
 
 ### Knowledge Base (Neo4j)
 
@@ -726,6 +755,8 @@ axolotl/
 │   │   ├── knowledge_store.py        # Neo4j KB graph store (Cypher)
 │   │   ├── knowledge_extraction.py   # Post-HITL KB write
 │   │   ├── patch_utils.py            # Search/Replace engine: middle-out fuzzy match, reindent, diagnostics
+│   │   ├── error_signature.py        # CI seed → searchable signature + fan-out merge helpers
+│   │   ├── log_reducer.py            # Deterministic CI log digest for LLM prompts
 │   │   ├── langsmith_tracing.py      # LangSmith env + run config helpers
 │   │   ├── sandbox_tools.py          # Ephemeral Docker validation helpers
 │   │   ├── ci_fix_state.py           # CIFixState + FilePatch/ArchitecturePlan/CritiqueResult

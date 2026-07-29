@@ -11,6 +11,7 @@ class EventType(Enum):
     WORKSPACE_SETUP = "workspace_setup"
     REQUIREMENTS_ANALYSIS = "requirements_analysis"
     TECHNICAL_ARCHITECTURE = "technical_architecture"
+    ERROR_EXPANSION = "error_expansion"
     TASK_BREAKDOWN = "task_breakdown"
     CODE_IMPLEMENTATION = "code_implementation"
     TESTING_VALIDATION = "testing_validation"
