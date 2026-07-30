@@ -173,7 +173,7 @@ def extract_error_signature(
         patterns.append(name_err.group(1))
 
     for code in _LINT_CODE_RE.findall(combined):
-        if code not in lint_codes:
+        if code not in lint_codes and code != "E999":
             lint_codes.append(code)
     if lint_codes and error_class == "unknown":
         error_class = "lint"

@@ -95,7 +95,11 @@ def validate_manifest(manifest_path: str) -> int:
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     files = list(manifest.get("files") or [])
     mode = str(manifest.get("mode") or "code")
-    lint_codes = [str(code) for code in manifest.get("lint_codes") or []]
+    lint_codes = [
+        str(code)
+        for code in manifest.get("lint_codes") or []
+        if str(code) != "E999"
+    ]
     patched_python = [
         str(item["patched"])
         for item in files
