@@ -24,7 +24,7 @@ class SearchReplaceBlock(TypedDict):
 class ArchitecturePlan(TypedDict):
     """Architect Agent output — low-blast-radius fix strategy."""
 
-    strategy_type: str  # deps | lint | format | code_patch
+    strategy_type: str  # deps | import | lint | format | code_patch | config | test
     affected_files: list[str]
     proposed_solution: str
 

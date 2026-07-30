@@ -50,7 +50,6 @@ from agents.patch_utils import (
     line_hint_for,
     normalize_patch_path,
 )
-from agents.prompt_builder import PromptBuilder
 from agents.sandbox_tools import cleanup_workspace, reset_workspace, validate_patches
 from schemas.fix import FilePatch as FixFilePatch
 from schemas.fix import FixProposal
@@ -69,7 +68,12 @@ class DiagnosisResult(BaseModel):
 
 
 class ArchitecturePlanModel(BaseModel):
-    strategy_type: str = Field(description="One of: deps, lint, format, code_patch")
+    strategy_type: str = Field(
+        description=(
+            "One of: deps, import, lint, format, code_patch, config, test. "
+            "Choose the category that best matches the diagnosed root cause."
+        )
+    )
     affected_files: list[str] = Field(
         description="All relative file paths that need edits"
     )
@@ -116,25 +120,45 @@ class CritiqueResultModel(BaseModel):
 
 def _persona_analyst() -> str:
     return """You are the Analyst Agent for Axolotl CI repair.
-Extract a precise root cause from CI logs. Prefer ModuleNotFoundError / lint / format failures.
-If historical KB context is provided, use it to refine the diagnosis when it clearly matches.
-Be concise. Return only the requested structured fields."""
+Your sole job is to diagnose the root cause of a CI failure from the provided log digest.
+
+Process:
+1. Identify the primary exception type or error message (e.g. ModuleNotFoundError,
+   TypeError, AssertionError, SyntaxError, YAML parse error, lint violation, etc.).
+2. Note the failing file(s) and line number(s) when visible in stack traces.
+3. Classify the failure: deps | import | lint | format | config | test | logic | unknown.
+4. Do NOT prefer any error family over another — follow the digest.
+
+Hard rules:
+- Trust the provided log digest; do not invent failures not present in it.
+- If historical KB context is provided, use it to refine the diagnosis only
+  when it clearly matches the current failure.
+- Be concise. Return only the requested structured fields."""
 
 
 def _persona_architect() -> str:
     return """You are the Architect Agent for Axolotl CI repair.
-Design a low-blast-radius fix. strategy_type must be one of: deps, lint, format, code_patch.
-List ALL affected_files that need modification (multi-file allowed when necessary).
-Prefer requirements.txt for missing modules.
-IMPORTANT: CI logs are often fail-fast and may only name ONE broken file. Still list every
-file you can infer from the logs/stack traces. A later error_expansion stage will search
-the repo for siblings with the same signature and enlarge this list.
+Design a low-blast-radius fix based on the diagnosed root cause.
+
+Process:
+1. Choose strategy_type from the evidence in the diagnosis and CI digest:
+   deps | import | lint | format | code_patch | config | test
+2. List ALL affected_files that need modification (multi-file allowed).
+3. Do NOT default to requirements.txt unless the diagnosis clearly says
+   "missing package" or "ModuleNotFoundError".
+
+IMPORTANT: CI logs are often fail-fast and may only name ONE broken file. Still
+list every file you can infer from the logs/stack traces. A later error_expansion
+stage will search the repo for siblings with the same signature and enlarge this list.
+
 Return ArchitecturePlan fields only."""
 
 
 def _persona_tech_lead() -> str:
     return """You are the Tech Lead Agent for Axolotl CI repair.
 Turn the ArchitecturePlan into an ordered, dependency-aware checklist (3-6 short steps).
+Your checklist should reflect the actual strategy (deps, import, lint, config, test,
+code_patch, etc.) — do not assume a specific error family.
 If expanded_files lists siblings beyond the seed failure, include a step to fix ALL of them
 in the same change set. Do not write code. Return only task_breakdown as a list of strings."""
 
@@ -142,7 +166,8 @@ in the same change set. Do not write code. Return only task_breakdown as a list 
 def _persona_developer() -> str:
     return """You are the Developer Agent for Axolotl CI repair — a precise code surgeon.
 You fix code by emitting SEARCH/REPLACE blocks, never whole files.
-Strict rules:
+
+Strict process rules (always apply):
 1. search_block must be copied CHARACTER-FOR-CHARACTER from the provided file contents:
    exact whitespace, exact indentation, exact blank lines. Never retype from memory.
 2. Keep each block minimal — only the lines that change plus 1-2 unchanged anchor lines.
@@ -151,11 +176,18 @@ Strict rules:
 5. Never put line-number prefixes or markdown fences inside blocks.
 6. If multiple files share the SAME error signature, emit blocks for EVERY listed file —
    do not stop after fixing the seed file from the CI log.
-Fix guidance:
-- ModuleNotFoundError → add the dependency to requirements.txt (imports only if required)
-- black/ruff format or lint errors → patch only the offending lines
+
+Fix guidance (follow the diagnosed root cause — these are examples, not the only paths):
+- Fix the diagnosed root cause in every expanded file.
+- Prefer the smallest correct change that resolves the failure.
+- For missing packages: add the dependency to the appropriate manifest file.
+- For lint/format: patch only the offending lines.
+- For logic/config/test errors: correct the faulty code, config value, or assertion.
+
 When revising, PRESERVE successful work: emit blocks only for what must still change,
-guided by validation_failures and review revision_instructions."""
+guided by validation_failures and review revision_instructions.
+IMPORTANT: If `validation_failures` reports lint/format errors (like unused imports)
+that were pre-existing, you MUST fix them anyway to unblock the pipeline."""
 
 
 def _persona_evaluator() -> str:
@@ -171,6 +203,8 @@ Approval criteria (ALL must be true):
 You MUST IGNORE:
 - Pre-existing unused imports, PEP8 issues, or code style problems that were
   already present in the ORIGINAL file BEFORE the developer's patch.
+  (However, if the developer FIXED these pre-existing issues to satisfy the linter,
+  do NOT reject the patch for being non-minimal. Accept the cleanup).
 - Functions, classes, or logic that the developer did NOT touch.
 - Any issue visible in the original file diff context marked as ORIGINAL.
 
@@ -445,19 +479,15 @@ class LangGraphCIFixAgent(BaseAgent):
             print(f"[KB] grounding lookup failed: {exc}")
             kb_grounding = ""
 
-        prompt = PromptBuilder.build_prompt(
-            PipelineFailure(
-                project_id=state["project_id"],
-                pipeline_id=state["pipeline_id"],
-                branch=state["branch"],
-                logs=digest,
-            ),
-            logs=digest,
-        )
+        # Slim diagnosis-only prompt — no legacy PromptBuilder (file_path / updated_content).
+        # Analyst only needs: project context, log digest, KB grounding, and a root_cause ask.
         human = (
-            f"{prompt}\n\n"
-            f"{kb_grounding}\n\n"
-            'Respond with JSON: {"root_cause": "..."}'
+            f"Project: {state['project_id']}\n"
+            f"Pipeline: {state['pipeline_id']}\n"
+            f"Branch: {state['branch']}\n\n"
+            f"CI failure log digest:\n{digest}\n\n"
+            + (f"{kb_grounding}\n\n" if kb_grounding else "")
+            + 'Diagnose the root cause. Respond with JSON: {"root_cause": "..."}'
         )
         structured = self.llm_flash.with_structured_output(DiagnosisResult)
         try:
@@ -494,17 +524,57 @@ class LangGraphCIFixAgent(BaseAgent):
             "messages": [HumanMessage(content=human)],
         }
 
+    @staticmethod
+    def _soft_error_hint(signature: dict) -> str:
+        """Build an optional soft hint from the error signature.
+
+        This is injected into Architect / Developer prompts so they get
+        error-class-specific guidance *only when the digest supports it*.
+        Hard rules live in the persona; this is advisory.
+        """
+        error_class = str(signature.get("error_class") or "unknown")
+        if error_class == "unknown":
+            return ""
+        parts = [f"Error signature hint (optional): class={error_class}"]
+        patterns = list(signature.get("patterns") or [])
+        if patterns:
+            parts.append(f"patterns={json.dumps(patterns[:6])}")
+        module = str(signature.get("module_name") or "")
+        if module:
+            parts.append(f"module={module}")
+        lint_codes = list(signature.get("lint_codes") or [])
+        if lint_codes:
+            parts.append(f"lint_codes={lint_codes[:5]}")
+        notes = str(signature.get("notes") or "")
+        if notes:
+            parts.append(f"notes={notes[:200]}")
+        parts.append(
+            "Use this hint only if it matches the digest; otherwise follow the digest."
+        )
+        return "\n".join(parts)
+
     async def _technical_architecture(self, state: CIFixState) -> dict[str, Any]:
         await self._emit(
             "technical_architecture",
             "Architect (Pro): designing multi-file plan...",
             {"model": self.pro_model},
         )
+        # Inject soft error hint when available (from earlier error_signature extraction
+        # that runs *after* this stage — on first pass we may not have it yet, but on
+        # re-invocations the state carries it forward).  Pre-architecture we derive a
+        # lightweight hint from the raw logs so the Architect is not flying blind.
+        pre_sig = extract_error_signature(
+            state.get("logs") or "",
+            root_cause=str(state.get("root_cause") or ""),
+            line_hints=dict(state.get("line_hints") or {}),
+        )
+        soft_hint = self._soft_error_hint(dict(pre_sig))
         human = (
             f"Root cause: {state.get('root_cause')}\n"
             f"KB grounding:\n{state.get('kb_grounding') or '(none)'}\n"
-            f"Relevant CI errors (digest):\n{logs_for_llm(state)}\n\n"
-            "Produce ArchitecturePlan JSON. List every affected file."
+            f"Relevant CI errors (digest):\n{logs_for_llm(state)}\n"
+            + (f"\n{soft_hint}\n" if soft_hint else "")
+            + "\nProduce ArchitecturePlan JSON. List every affected file."
         )
         structured = self.llm_pro.with_structured_output(ArchitecturePlanModel)
         try:
@@ -742,16 +812,34 @@ class LangGraphCIFixAgent(BaseAgent):
             for p in (state.get("expanded_files") or plan.get("affected_files") or [])
             if p
         ]
-        target_files = list(
+
+        # Parse file paths from validation failures so the agent can see them
+        validation_files: list[str] = []
+        if is_revision:
+            for failure_text in failures:
+                for match in re.finditer(r"\b([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]{2,4})\b", failure_text):
+                    path = normalize_patch_path(match.group(1))
+                    if path not in validation_files:
+                        validation_files.append(path)
+
+        explicit_files = list(
             dict.fromkeys(
                 [normalize_patch_path(p["file_path"]) for p in existing]
                 + expanded
                 + [normalize_patch_path(f) for f in (plan.get("affected_files") or [])]
             )
         )
+        target_files = list(dict.fromkeys(explicit_files + validation_files))
+
         for path in target_files:
             if path not in baseline:
                 baseline[path] = await self._fetch_original(path)
+                
+        # Drop fake files parsed from validation output if they don't exist
+        target_files = [
+            p for p in target_files 
+            if baseline.get(p) is not None or p in explicit_files
+        ]
 
         patched_now = {normalize_patch_path(p["file_path"]): p["updated_content"] for p in existing}
         working: dict[str, str] = {}
@@ -790,6 +878,7 @@ class LangGraphCIFixAgent(BaseAgent):
                 "Cover every expanded sibling that still has the error."
             )
         else:
+            soft_hint = self._soft_error_hint(signature)
             human = (
                 f"Project: {state['project_id']}\n"
                 f"Pipeline: {state['pipeline_id']}\n"
@@ -798,11 +887,11 @@ class LangGraphCIFixAgent(BaseAgent):
                 f"KB grounding:\n{state.get('kb_grounding') or '(none)'}\n"
                 f"ArchitecturePlan: {json.dumps(plan)}\n"
                 f"Expanded files (fix ALL of these if they share the error): {json.dumps(expanded)}\n"
-                f"Error signature: {json.dumps(signature)}\n"
                 f"Tasks: {json.dumps(tasks)}\n"
                 f"Failure line hints: {json.dumps(hints) or '(none)'}\n"
-                f"Relevant CI errors (digest):\n{logs_for_llm(state)}\n\n"
-                "FILE CONTENTS (search blocks must match this text exactly):\n"
+                f"Relevant CI errors (digest):\n{logs_for_llm(state)}\n"
+                + (f"\n{soft_hint}\n" if soft_hint else "")
+                + "\nFILE CONTENTS (search blocks must match this text exactly):\n"
                 f"{files_context}\n\n"
                 "Return SearchReplaceProposal JSON: blocks + commit_message. "
                 "Emit blocks for every expanded file that contains the error signature."

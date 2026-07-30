@@ -2,13 +2,19 @@ from schemas.pipeline import PipelineFailure
 
 
 class PromptBuilder:
-    """Builds structured prompts for Gemini-based CI fix analysis."""
+    """Builds structured prompts for the legacy one-shot CI fix agent (LegacyCIFixAgent).
+
+    NOTE: The LangGraph multi-stage pipeline no longer uses this class.
+    It builds slim, diagnosis-only prompts inline to avoid biasing the model
+    toward specific error families. Keep this class for the legacy code path.
+    """
 
     @staticmethod
     def build_prompt(failure: PipelineFailure, logs: str | None = None) -> str:
         """
         Create a JSON-focused prompt for Gemini using the failed pipeline data.
 
+        This is the legacy one-shot prompt shape (file_path / updated_content).
         Prefer passing a pre-reduced `logs` digest; falls back to failure.logs.
         """
         log_text = logs if logs is not None else failure.logs
