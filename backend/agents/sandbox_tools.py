@@ -7,6 +7,8 @@ named container). Commands are allowlisted to avoid shell injection.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -27,6 +29,7 @@ WORKSPACE_ROOT = Path(
 )
 # Resolve the sandbox directory (contains Dockerfile) relative to this file.
 _SANDBOX_DIR = Path(__file__).resolve().parent.parent / "sandbox"
+_VALIDATOR_HASH_LABEL = "com.axolotl.validator.source-sha256"
 
 # Safe relative path: no absolute paths, no .. traversal
 _SAFE_REL_PATH = re.compile(r"^(?!/)(?!.*\.\.(?:/|$))[A-Za-z0-9_./\-]+$")
@@ -59,13 +62,8 @@ def _ensure_validator_image(client, image_name: str) -> bool:
     Returns True if the image is available (pre-existing or freshly built),
     False if the build failed or the Dockerfile is missing.
     """
-    try:
-        client.images.get(image_name)
-        return True
-    except Exception:
-        pass  # Image not found, attempt auto-build below
-
     dockerfile_path = _SANDBOX_DIR / "Dockerfile"
+    validator_path = _SANDBOX_DIR / "axolotl_validate.py"
     if not dockerfile_path.exists():
         logger.warning(
             "Cannot auto-build '%s': Dockerfile not found at %s",
@@ -73,6 +71,19 @@ def _ensure_validator_image(client, image_name: str) -> bool:
             dockerfile_path,
         )
         return False
+
+    source_hash = hashlib.sha256(
+        dockerfile_path.read_bytes()
+        + (validator_path.read_bytes() if validator_path.exists() else b"")
+    ).hexdigest()
+    try:
+        image = client.images.get(image_name)
+        labels = (image.attrs.get("Config") or {}).get("Labels") or {}
+        if labels.get(_VALIDATOR_HASH_LABEL) == source_hash:
+            return True
+        logger.info("Validator image '%s' is stale; rebuilding it.", image_name)
+    except Exception:
+        pass  # Image not found, attempt auto-build below
 
     logger.info(
         "Validator image '%s' not found — auto-building from %s ...",
@@ -84,6 +95,7 @@ def _ensure_validator_image(client, image_name: str) -> bool:
             path=str(_SANDBOX_DIR),
             dockerfile="Dockerfile",
             tag=image_name,
+            labels={_VALIDATOR_HASH_LABEL: source_hash},
             rm=True,
         )
         logger.info("Successfully built validator image '%s'.", image_name)
@@ -172,8 +184,26 @@ def run_check(
 
     Mounts `workspace` at /workspace and executes without a shell.
     """
-    image_name = image or VALIDATOR_IMAGE
     argv = _allowlisted_argv(file_path, logs)
+    return _run_argv(
+        workspace,
+        argv,
+        image=image,
+        timeout_seconds=timeout_seconds,
+        needs_network=argv[:2] == ["pip", "install"],
+    )
+
+
+def _run_argv(
+    workspace: Path,
+    argv: list[str],
+    *,
+    image: Optional[str] = None,
+    timeout_seconds: int = 120,
+    needs_network: bool = False,
+) -> CheckResult:
+    """Run one allowlisted argv in one ephemeral validator container."""
+    image_name = image or VALIDATOR_IMAGE
     command_display = " ".join(argv)
 
     if not _docker_available():
@@ -187,7 +217,7 @@ def run_check(
         )
 
     import docker
-    from docker.errors import ContainerError, ImageNotFound, APIError
+    from docker.errors import APIError, ContainerError
 
     client = docker.from_env()
 
@@ -205,8 +235,6 @@ def run_check(
 
     host_path = str(workspace.resolve())
 
-    # pip install needs network; compile/lint checks stay isolated.
-    needs_network = argv[:2] == ["pip", "install"]
     run_kwargs: dict = {
         "image": image_name,
         "command": argv,
@@ -268,50 +296,88 @@ def validate_patches(
     pipeline_id: str,
     file_patches: list[dict],
     logs: str = "",
+    *,
+    original_contents: Optional[dict[str, str]] = None,
+    strategy_type: str = "",
+    error_signature: Optional[dict] = None,
 ) -> CheckResult:
     """
-    Write all patches into one workspace and run checks.
+    Validate all original/patched file pairs in one ephemeral container.
 
-    For deps/ModuleNotFound → pip install -r on requirements.txt if present.
-    Otherwise run allowlisted check on each Python file; first failure wins.
+    Syntax failures and in-scope newly introduced findings are hard failures.
+    Pre-existing findings are ignored, while newly introduced out-of-scope lint
+    findings are reported as advisory output.
     """
     if not file_patches:
         return CheckResult(passed=False, output="No file_patches provided", command="validate_patches")
 
     workspace = reset_workspace(pipeline_id)
-    written: list[str] = []
+    originals = {
+        path.replace("\\", "/").lstrip("/"): content
+        for path, content in (original_contents or {}).items()
+    }
+    manifest_files: list[dict[str, Optional[str]]] = []
+    requirements_path: Optional[str] = None
     for patch in file_patches:
         path = (patch.get("file_path") if isinstance(patch, dict) else getattr(patch, "file_path", "")) or ""
         content = (patch.get("updated_content") if isinstance(patch, dict) else getattr(patch, "updated_content", "")) or ""
+        normalized = path.replace("\\", "/").lstrip("/")
+        patched_path = f"patched/{normalized}"
+        original_path: Optional[str] = None
         try:
-            write_temp_file(workspace, path, content)
-            written.append(path)
+            write_temp_file(workspace, patched_path, content)
+            if normalized in originals:
+                original_path = f"original/{normalized}"
+                write_temp_file(workspace, original_path, originals[normalized])
         except ValueError as exc:
             return CheckResult(passed=False, output=str(exc), command="write_temp_file")
 
-    # Prefer requirements.txt check when present or ModuleNotFound in logs
-    req = next((p for p in written if p.replace("\\", "/").endswith("requirements.txt")), None)
-    logs_lower = (logs or "").lower()
-    if req or "modulenotfounderror" in logs_lower or "no module named" in logs_lower:
-        target = req or "requirements.txt"
-        if (workspace / target).exists() or req:
-            return run_check(workspace, req or target, logs)
+        manifest_files.append(
+            {
+                "path": normalized,
+                "patched": patched_path,
+                "original": original_path,
+            }
+        )
+        if normalized.lower().endswith("requirements.txt"):
+            requirements_path = patched_path
 
-    outputs: list[str] = []
-    for path in written:
-        result = run_check(workspace, path, logs)
-        outputs.append(f"$ {result.command}\n{result.output}")
-        if not result.passed:
-            return CheckResult(
-                passed=False,
-                output="\n\n".join(outputs),
-                command=result.command,
-            )
+    signature = dict(error_signature or {})
+    error_class = str(signature.get("error_class") or "").lower()
+    strategy = (strategy_type or "").lower()
+    lint_codes = [
+        str(code).upper()
+        for code in (signature.get("lint_codes") or [])
+        if code
+    ]
+    if strategy == "deps" or error_class == "deps":
+        mode = "deps"
+    elif strategy == "format" or error_class == "format":
+        mode = "format"
+    elif strategy == "lint" or error_class == "lint":
+        mode = "lint"
+    elif strategy == "import" or error_class == "import":
+        mode = "import"
+    else:
+        mode = "code"
 
-    return CheckResult(
-        passed=True,
-        output="\n\n".join(outputs) or "all patches validated",
-        command="validate_patches",
+    manifest = {
+        "mode": mode,
+        "lint_codes": lint_codes if mode == "lint" else [],
+        "requirements_path": requirements_path,
+        "files": manifest_files,
+    }
+    manifest_path = "validation-manifest.json"
+    write_temp_file(
+        workspace,
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=True),
+    )
+    argv = ["python", "-m", "axolotl_validate", "--manifest", manifest_path]
+    return _run_argv(
+        workspace,
+        argv,
+        needs_network=mode == "deps" and bool(requirements_path),
     )
 
 

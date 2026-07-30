@@ -50,6 +50,12 @@ from agents.patch_utils import (
     line_hint_for,
     normalize_patch_path,
 )
+from agents.repo_map import (
+    build_repo_map,
+    extract_idents_from_text,
+    high_confidence_neighbors,
+    map_max_files,
+)
 from agents.sandbox_tools import cleanup_workspace, reset_workspace, validate_patches
 from schemas.fix import FilePatch as FixFilePatch
 from schemas.fix import FixProposal
@@ -97,12 +103,35 @@ class SearchReplaceBlockModel(BaseModel):
     replace_block: str = Field(description="Replacement lines for the search_block")
 
 
+class WholeFilePatchModel(BaseModel):
+    """Full-file replacement when SEARCH/REPLACE is the wrong tool."""
+
+    file_path: str = Field(description="Relative path of the file to replace entirely")
+    updated_content: str = Field(
+        description="Complete new file contents — never omit sections with ellipses"
+    )
+
+
 class SearchReplaceProposal(BaseModel):
     root_cause: str = Field(description="Root cause summary")
     blocks: list[SearchReplaceBlockModel] = Field(
-        description="Ordered SEARCH/REPLACE blocks; multiple blocks per file allowed"
+        default_factory=list,
+        description=(
+            "Ordered SEARCH/REPLACE blocks for large/targeted edits; "
+            "multiple blocks per file allowed"
+        ),
+    )
+    whole_files: list[WholeFilePatchModel] = Field(
+        default_factory=list,
+        description=(
+            "Full-file replacements for new files, small files (<=120 lines), "
+            "or files where SEARCH/REPLACE previously failed to apply"
+        ),
     )
     commit_message: str = Field(description="Short conventional commit message")
+
+
+WHOLE_FILE_LINE_LIMIT = 120
 
 
 class CritiqueResultModel(BaseModel):
@@ -165,29 +194,35 @@ in the same change set. Do not write code. Return only task_breakdown as a list 
 
 def _persona_developer() -> str:
     return """You are the Developer Agent for Axolotl CI repair — a precise code surgeon.
-You fix code by emitting SEARCH/REPLACE blocks, never whole files.
+You emit a hybrid patch proposal: SEARCH/REPLACE blocks and/or whole-file updates.
 
-Strict process rules (always apply):
-1. search_block must be copied CHARACTER-FOR-CHARACTER from the provided file contents:
-   exact whitespace, exact indentation, exact blank lines. Never retype from memory.
-2. Keep each block minimal — only the lines that change plus 1-2 unchanged anchor lines.
+When to use each emit style:
+- SEARCH/REPLACE (`blocks`): default for large files and small targeted edits.
+  search_block must be copied CHARACTER-FOR-CHARACTER from the provided file contents.
+- Whole-file (`whole_files`): use when the file is NEW, the current file is <= 120 lines,
+  or a previous pass failed to apply SEARCH/REPLACE for that file. Provide the COMPLETE
+  updated file contents — never elide with "...".
+
+Strict process rules:
+1. Prefer the smallest correct change that resolves the diagnosed root cause.
+2. Keep SEARCH/REPLACE blocks minimal — changing lines plus 1-2 anchor lines.
 3. Multiple blocks per file are allowed; they apply top to bottom.
-4. To create a NEW file, use an empty search_block and put the full contents in replace_block.
-5. Never put line-number prefixes or markdown fences inside blocks.
-6. If multiple files share the SAME error signature, emit blocks for EVERY listed file —
-   do not stop after fixing the seed file from the CI log.
+4. Empty search_block also creates a new file (legacy); prefer whole_files for new files.
+5. Never put line-number prefixes or markdown fences inside blocks or whole_files.
+6. If multiple files share the SAME error signature, emit edits for EVERY listed file.
+7. A proposal may mix blocks and whole_files across different paths.
 
-Fix guidance (follow the diagnosed root cause — these are examples, not the only paths):
+Fix guidance (follow the diagnosed root cause — examples, not the only paths):
 - Fix the diagnosed root cause in every expanded file.
-- Prefer the smallest correct change that resolves the failure.
 - For missing packages: add the dependency to the appropriate manifest file.
 - For lint/format: patch only the offending lines.
 - For logic/config/test errors: correct the faulty code, config value, or assertion.
 
-When revising, PRESERVE successful work: emit blocks only for what must still change,
+When revising, PRESERVE successful work: emit edits only for what must still change,
 guided by validation_failures and review revision_instructions.
-IMPORTANT: If `validation_failures` reports lint/format errors (like unused imports)
-that were pre-existing, you MUST fix them anyway to unblock the pipeline."""
+If `validation_failures` reports NEW issues introduced by your last patch, fix those.
+Do NOT expand blast radius by cleaning unrelated pre-existing lint unless validation
+explicitly requires it for the failure class."""
 
 
 def _persona_evaluator() -> str:
@@ -373,6 +408,7 @@ class LangGraphCIFixAgent(BaseAgent):
         workflow.add_node("requirements_analysis", self._requirements_analysis)
         workflow.add_node("technical_architecture", self._technical_architecture)
         workflow.add_node("error_expansion", self._error_expansion)
+        workflow.add_node("repo_map", self._repo_map)
         workflow.add_node("task_breakdown", self._task_breakdown)
         workflow.add_node("code_implementation", self._code_implementation)
         workflow.add_node("testing_validation", self._testing_validation)
@@ -382,7 +418,8 @@ class LangGraphCIFixAgent(BaseAgent):
         workflow.add_edge("workspace_setup", "requirements_analysis")
         workflow.add_edge("requirements_analysis", "technical_architecture")
         workflow.add_edge("technical_architecture", "error_expansion")
-        workflow.add_edge("error_expansion", "task_breakdown")
+        workflow.add_edge("error_expansion", "repo_map")
+        workflow.add_edge("repo_map", "task_breakdown")
         workflow.add_edge("task_breakdown", "code_implementation")
         workflow.add_edge("code_implementation", "testing_validation")
         workflow.add_conditional_edges(
@@ -703,6 +740,125 @@ class LangGraphCIFixAgent(BaseAgent):
             "architecture_plan": plan,
         }
 
+    async def _repo_map(self, state: CIFixState) -> dict[str, Any]:
+        """Build a seeded symbol map from MCP-fetched file contents."""
+        expanded = [
+            normalize_patch_path(p)
+            for p in (state.get("expanded_files") or [])
+            if p
+        ]
+        plan = _plan_as_dict(state.get("architecture_plan"))
+        seed = list(
+            dict.fromkeys(
+                expanded
+                + [
+                    normalize_patch_path(p)
+                    for p in (plan.get("affected_files") or [])
+                    if p
+                ]
+                + [
+                    normalize_patch_path(p)
+                    for p in (state.get("line_hints") or {})
+                    if p
+                ]
+            )
+        )
+        idents = extract_idents_from_text(
+            str(state.get("root_cause") or ""),
+            logs_for_llm(state),
+            " ".join(str(p) for p in ((state.get("error_signature") or {}).get("patterns") or [])),
+        )
+        await self._emit(
+            "repo_map",
+            f"Building seeded symbol map from {len(seed)} seed file(s)...",
+            {"seed_files": seed[:12], "idents": sorted(idents)[:20]},
+        )
+
+        baseline: dict[str, str] = {
+            normalize_patch_path(k): v
+            for k, v in dict(state.get("file_contents") or {}).items()
+            if v is not None
+        }
+        for path in seed:
+            if path not in baseline:
+                fetched = await self._fetch_original(path)
+                if fetched is not None:
+                    baseline[path] = fetched
+
+        # First pass ranks among known contents; then fetch top unknown neighbors
+        # discovered via search_code when the searcher can resolve symbol names.
+        _, ranked = build_repo_map(
+            seed_files=seed,
+            file_contents=baseline,
+            mentioned_idents=idents,
+            max_files=map_max_files(),
+        )
+
+        # Ask the repo searcher for files mentioning high-value idents so the
+        # map can pull definition/call-site neighbors not already in expanded.
+        neighbor_candidates: list[str] = []
+        search_idents = sorted(
+            (i for i in idents if len(i) >= 4 and ("_" in i or i[:1].islower())),
+            key=len,
+            reverse=True,
+        )[:5]
+        if search_idents:
+            neighbor_candidates = await self._search_siblings(search_idents)
+
+        for path in list(dict.fromkeys(ranked + neighbor_candidates)):
+            if len(baseline) >= map_max_files() + len(seed):
+                break
+            if path in baseline:
+                continue
+            fetched = await self._fetch_original(path)
+            if fetched is not None:
+                baseline[path] = fetched
+
+        map_text, map_files = build_repo_map(
+            seed_files=seed,
+            file_contents=baseline,
+            mentioned_idents=idents,
+            max_files=map_max_files(),
+        )
+        merge_paths = high_confidence_neighbors(
+            ranked_files=map_files,
+            seed_files=seed,
+            file_contents=baseline,
+            mentioned_idents=idents,
+        )
+        new_expanded = merge_affected_files(
+            expanded,
+            merge_paths,
+            error_class=str((state.get("error_signature") or {}).get("error_class") or "unknown"),
+            max_files=max(self.expansion_max_files, map_max_files()),
+        )
+        plan = {
+            **plan,
+            "affected_files": new_expanded,
+        }
+
+        await self._emit(
+            "repo_map",
+            (
+                f"Repo map ready ({len(map_files)} file(s)"
+                + (f", +{len(merge_paths)} symbol neighbor(s)" if merge_paths else "")
+                + ")"
+            ),
+            {
+                "map_files": map_files[:20],
+                "merged_neighbors": merge_paths[:12],
+                "map_chars": len(map_text),
+            },
+        )
+        return {
+            "current_stage": "repo_map",
+            "repo_map": map_text,
+            "map_files": map_files,
+            "expanded_files": new_expanded,
+            "architecture_plan": plan,
+            "file_contents": baseline,
+        }
+
     async def _task_breakdown(self, state: CIFixState) -> dict[str, Any]:
         plan = _plan_as_dict(state.get("architecture_plan"))
         expanded = list(state.get("expanded_files") or plan.get("affected_files") or [])
@@ -715,7 +871,8 @@ class LangGraphCIFixAgent(BaseAgent):
             f"Root cause: {state.get('root_cause')}\n"
             f"ArchitecturePlan: {json.dumps(plan)}\n"
             f"Expanded files (seed + same-error siblings): {json.dumps(expanded)}\n"
-            f"Error signature: {json.dumps(state.get('error_signature') or {})}\n\n"
+            f"Error signature: {json.dumps(state.get('error_signature') or {})}\n"
+            f"Repo map:\n{state.get('repo_map') or '(none)'}\n\n"
             "Produce task_breakdown as an ordered list of 3-6 short strings. "
             "Include fixing EVERY expanded file when they share the same error."
         )
@@ -767,7 +924,10 @@ class LangGraphCIFixAgent(BaseAgent):
     ) -> str:
         """One file's contents for the developer prompt (hint-windowed if huge)."""
         if content is None:
-            return f"### {path} (NEW FILE — does not exist yet; create it with an empty search_block)"
+            return (
+                f"### {path} (NEW FILE — does not exist yet; "
+                "prefer whole_files with the complete contents, or an empty search_block)"
+            )
         if len(content) <= self._FILE_CONTEXT_CHAR_CAP:
             return f"### {path}\n{content}"
         lines = content.splitlines()
@@ -794,9 +954,9 @@ class LangGraphCIFixAgent(BaseAgent):
         await self._emit(
             "code_implementation",
             (
-                "Developer (Pro): targeted SEARCH/REPLACE revision..."
+                "Developer (Pro): targeted hybrid revision..."
                 if is_revision
-                else "Developer (Pro): generating SEARCH/REPLACE blocks (single pass)..."
+                else "Developer (Pro): generating hybrid SEARCH/REPLACE + whole-file proposal..."
             ),
             {
                 "model": self.pro_model,
@@ -806,75 +966,88 @@ class LangGraphCIFixAgent(BaseAgent):
             },
         )
 
-        # ── Gather real file contents (originals via MCP-backed fetcher) ──
         expanded = [
             normalize_patch_path(p)
             for p in (state.get("expanded_files") or plan.get("affected_files") or [])
             if p
         ]
 
-        # Parse file paths from validation failures so the agent can see them
         validation_files: list[str] = []
         if is_revision:
             for failure_text in failures:
-                for match in re.finditer(r"\b([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]{2,4})\b", failure_text):
-                    path = normalize_patch_path(match.group(1))
-                    if path not in validation_files:
-                        validation_files.append(path)
+                for match in re.finditer(
+                    r"\b([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]{2,4})\b", failure_text
+                ):
+                    path_name = normalize_patch_path(match.group(1))
+                    if path_name not in validation_files:
+                        validation_files.append(path_name)
 
         explicit_files = list(
             dict.fromkeys(
                 [normalize_patch_path(p["file_path"]) for p in existing]
                 + expanded
                 + [normalize_patch_path(f) for f in (plan.get("affected_files") or [])]
+                + [normalize_patch_path(p) for p in (state.get("map_files") or [])]
             )
         )
         target_files = list(dict.fromkeys(explicit_files + validation_files))
 
-        for path in target_files:
-            if path not in baseline:
-                baseline[path] = await self._fetch_original(path)
-                
-        # Drop fake files parsed from validation output if they don't exist
+        for file_path in target_files:
+            if file_path not in baseline:
+                baseline[file_path] = await self._fetch_original(file_path)
+
         target_files = [
-            p for p in target_files 
-            if baseline.get(p) is not None or p in explicit_files
+            p for p in target_files if baseline.get(p) is not None or p in explicit_files
         ]
 
-        patched_now = {normalize_patch_path(p["file_path"]): p["updated_content"] for p in existing}
+        patched_now = {
+            normalize_patch_path(p["file_path"]): p["updated_content"] for p in existing
+        }
         working: dict[str, str] = {}
-        for path in target_files:
-            if is_revision and path in patched_now:
-                working[path] = patched_now[path]
+        for file_path in target_files:
+            if is_revision and file_path in patched_now:
+                working[file_path] = patched_now[file_path]
             else:
-                working[path] = baseline.get(path) or ""
+                working[file_path] = baseline.get(file_path) or ""
 
+        emit_hints = self._emit_style_hints(
+            working, list(state.get("patch_failures") or [])
+        )
         sections = []
-        for path in target_files:
-            shown = working[path] if (is_revision and path in patched_now) else baseline.get(path)
+        for file_path in target_files:
+            shown = (
+                working[file_path]
+                if (is_revision and file_path in patched_now)
+                else baseline.get(file_path)
+            )
             sections.append(
-                self._file_context_section(path, shown, line_hint_for(hints, path))
+                self._file_context_section(
+                    file_path, shown, line_hint_for(hints, file_path)
+                )
             )
         files_context = "\n\n".join(sections) or "(no file contents available)"
+        repo_map_text = str(state.get("repo_map") or "(none)")
 
         tasks = state.get("task_breakdown") or []
         signature = state.get("error_signature") or {}
         if is_revision:
             last_critique = history[-1] if history else None
             human = (
-                "TARGETED REVISION — emit SEARCH/REPLACE blocks ONLY for what must still change.\n"
+                "TARGETED REVISION — emit hybrid edits ONLY for what must still change.\n"
                 f"Root cause: {state.get('root_cause')}\n"
                 f"ArchitecturePlan: {json.dumps(plan)}\n"
                 f"Expanded files: {json.dumps(expanded)}\n"
                 f"Error signature: {json.dumps(signature)}\n"
                 f"Tasks: {json.dumps(tasks)}\n"
+                f"Emit style hints: {json.dumps(emit_hints)}\n"
+                f"Repo map:\n{repo_map_text}\n"
                 f"validation_failures: {json.dumps(failures[-3:])}\n"
                 f"patch apply failures: {json.dumps(list(state.get('patch_failures') or [])[-3:])}\n"
                 f"latest critique: {json.dumps(last_critique)}\n\n"
                 "CURRENT FILE CONTENTS (your prior patches are already applied — "
                 "search blocks must match THIS text exactly):\n"
                 f"{files_context}\n\n"
-                "Return SearchReplaceProposal JSON: blocks + commit_message. "
+                "Return SearchReplaceProposal JSON: blocks and/or whole_files + commit_message. "
                 "Cover every expanded sibling that still has the error."
             )
         else:
@@ -888,33 +1061,60 @@ class LangGraphCIFixAgent(BaseAgent):
                 f"ArchitecturePlan: {json.dumps(plan)}\n"
                 f"Expanded files (fix ALL of these if they share the error): {json.dumps(expanded)}\n"
                 f"Tasks: {json.dumps(tasks)}\n"
+                f"Emit style hints: {json.dumps(emit_hints)}\n"
                 f"Failure line hints: {json.dumps(hints) or '(none)'}\n"
+                f"Repo map:\n{repo_map_text}\n"
                 f"Relevant CI errors (digest):\n{logs_for_llm(state)}\n"
                 + (f"\n{soft_hint}\n" if soft_hint else "")
                 + "\nFILE CONTENTS (search blocks must match this text exactly):\n"
                 f"{files_context}\n\n"
-                "Return SearchReplaceProposal JSON: blocks + commit_message. "
-                "Emit blocks for every expanded file that contains the error signature."
+                "Return SearchReplaceProposal JSON: blocks and/or whole_files + commit_message. "
+                "Emit edits for every expanded file that contains the error signature."
             )
 
         proposal = await self._invoke_search_replace(state, human)
-        blocks = proposal["blocks"]
+        blocks = list(proposal["blocks"])
+        whole_files = list(proposal.get("whole_files") or [])
 
-        # ── Apply the blocks through the fuzzy patch engine ──
+        for item in whole_files:
+            file_path = normalize_patch_path(str(item.get("file_path") or ""))
+            if not file_path:
+                continue
+            working[file_path] = str(item.get("updated_content") or "")
+            blocks = [
+                b
+                for b in blocks
+                if normalize_patch_path(str(b.get("file_path") or "")) != file_path
+            ]
+
         outcome = apply_blocks(blocks, working, hints, self.fuzzy_threshold)
 
-        # ── Rich diagnostic feedback loop: retry ONLY failed blocks ──
         patch_failures: list[str] = []
         for failed_block, diagnostics in outcome.failed:
-            path = normalize_patch_path(str(failed_block.get("file_path") or ""))
+            file_path = normalize_patch_path(str(failed_block.get("file_path") or ""))
             fixed = False
-            for _ in range(self.block_retries):
-                current = outcome.contents.get(path, "")
+            current = outcome.contents.get(file_path, working.get(file_path, ""))
+            if self._prefer_whole_file(
+                current, file_path, list(state.get("patch_failures") or [])
+            ):
+                whole = await self._invoke_whole_file_fix(
+                    file_path, current, diagnostics.error, state
+                )
+                if whole is not None:
+                    outcome.contents[file_path] = whole
+                    fixed = True
+                    await self._emit(
+                        "code_implementation",
+                        f"Fell back to whole-file rewrite for small/failed path {file_path}",
+                        {"file": file_path, "strategy": "whole_file_fallback"},
+                    )
+            for _ in range(0 if fixed else self.block_retries):
+                current = outcome.contents.get(file_path, "")
                 nearest = find_nearest_match(
                     current, str(failed_block.get("search_block") or ""), context=12
                 )
                 feedback = build_block_failure_feedback(
-                    file_path=path,
+                    file_path=file_path,
                     error=diagnostics.error,
                     nearest_match=nearest,
                     applied_count=len(outcome.applied),
@@ -922,9 +1122,9 @@ class LangGraphCIFixAgent(BaseAgent):
                 )
                 await self._emit(
                     "code_implementation",
-                    f"Block failed in {path}; requesting targeted fix (cached "
+                    f"Block failed in {file_path}; requesting targeted fix (cached "
                     f"{len(outcome.applied)}/{len(blocks)} applied blocks)...",
-                    {"file": path, "error": diagnostics.error[:300]},
+                    {"file": file_path, "error": diagnostics.error[:300]},
                 )
                 candidate = await self._invoke_block_fix(failed_block, feedback)
                 if candidate is None:
@@ -933,45 +1133,48 @@ class LangGraphCIFixAgent(BaseAgent):
                     current,
                     candidate.get("search_block") or "",
                     candidate.get("replace_block") or "",
-                    line_hint=line_hint_for(hints, path),
+                    line_hint=line_hint_for(hints, file_path),
                     threshold=self.fuzzy_threshold,
                 )
                 if retry.success:
-                    outcome.contents[path] = retry.content
+                    outcome.contents[file_path] = retry.content
                     outcome.applied.append(candidate)
                     fixed = True
                     break
                 diagnostics = retry
                 failed_block = candidate
             if not fixed:
-                patch_failures.append(f"{path}: {diagnostics.error}")
+                patch_failures.append(f"{file_path}: {diagnostics.error}")
 
-        # ── Collect changed files as full-content patches for downstream stages ──
+        for file_path, content in working.items():
+            if file_path not in outcome.contents:
+                outcome.contents[file_path] = content
+
         patches: list[FilePatch] = [
-            {"file_path": path, "updated_content": content}
-            for path, content in outcome.contents.items()
-            if content != (baseline.get(path) or "")
+            {"file_path": file_path, "updated_content": content}
+            for file_path, content in outcome.contents.items()
+            if content != (baseline.get(file_path) or "")
         ]
 
         paths = [p["file_path"] for p in patches]
         await self._emit(
             "code_implementation",
             (
-                f"Applied {len(outcome.applied)}/{len(blocks)} block(s) across "
-                f"{len(paths)} file(s): {', '.join(paths[:5])} — {proposal['commit_message']}"
+                f"Applied {len(outcome.applied)} S/R block(s) + {len(whole_files)} whole-file(s) "
+                f"across {len(paths)} file(s): {', '.join(paths[:5])} — {proposal['commit_message']}"
                 + (f" | {len(patch_failures)} block(s) unresolved" if patch_failures else "")
             ),
             {
                 "files": paths,
-                "blocks_applied": len(outcome.applied),
-                "blocks_total": len(blocks),
-                "patch_failures": patch_failures[:5],
+                "applied_blocks": len(outcome.applied),
+                "whole_files": len(whole_files),
+                "failed_blocks": len(patch_failures),
                 "commit_message": proposal["commit_message"],
             },
         )
         return {
             "current_stage": "code_implementation",
-            "root_cause": proposal["root_cause"],
+            "root_cause": proposal["root_cause"] or state.get("root_cause") or "",
             "file_patches": patches,
             "commit_message": proposal["commit_message"],
             "search_replace_blocks": [
@@ -988,8 +1191,67 @@ class LangGraphCIFixAgent(BaseAgent):
             "messages": [HumanMessage(content=human)],
         }
 
+    @staticmethod
+    def _prefer_whole_file(
+        content: str, file_path: str, prior_failures: list[str]
+    ) -> bool:
+        if not content.strip():
+            return True
+        if any(file_path in failure for failure in prior_failures):
+            return True
+        return content.count("\n") + 1 <= WHOLE_FILE_LINE_LIMIT
+
+    def _emit_style_hints(
+        self, working: dict[str, str], prior_failures: list[str]
+    ) -> dict[str, str]:
+        hints: dict[str, str] = {}
+        for file_path, content in working.items():
+            if self._prefer_whole_file(content, file_path, prior_failures):
+                hints[file_path] = "prefer_whole_file"
+            else:
+                hints[file_path] = "prefer_search_replace"
+        return hints
+
+    async def _invoke_whole_file_fix(
+        self,
+        file_path: str,
+        current: str,
+        error: str,
+        state: CIFixState,
+    ) -> Optional[str]:
+        """One-shot whole-file rewrite for small/failed SEARCH/REPLACE paths."""
+        human = (
+            f"SEARCH/REPLACE failed for `{file_path}`: {error}\n"
+            "Return ONLY a WholeFilePatch JSON object with the COMPLETE updated file:\n"
+            '{"file_path": "...", "updated_content": "..."}\n\n'
+            f"Root cause: {state.get('root_cause')}\n"
+            f"Current file contents:\n{current}\n"
+        )
+        structured = self.llm_pro.with_structured_output(WholeFilePatchModel)
+        try:
+            result = await structured.ainvoke(
+                [SystemMessage(content=_persona_developer()), HumanMessage(content=human)]
+            )
+            patch = (
+                result
+                if isinstance(result, WholeFilePatchModel)
+                else WholeFilePatchModel.model_validate(result)
+            )
+            return str(patch.updated_content)
+        except Exception:
+            try:
+                response = await self.llm_pro.ainvoke(
+                    [SystemMessage(content=_persona_developer()), HumanMessage(content=human)]
+                )
+                payload = _extract_json_object(getattr(response, "content", "") or "")
+                if payload.get("updated_content") is not None:
+                    return str(payload.get("updated_content"))
+            except Exception as exc:
+                print(f"[PatchEngine] Whole-file fallback failed: {exc}")
+        return None
+
     async def _invoke_search_replace(self, state: CIFixState, human: str) -> dict[str, Any]:
-        """Single-pass generation of SEARCH/REPLACE blocks (Gemini Pro)."""
+        """Single-pass generation of hybrid SEARCH/REPLACE + whole-file edits."""
         structured = self.llm_pro.with_structured_output(SearchReplaceProposal)
         try:
             result = await structured.ainvoke(
@@ -1001,6 +1263,7 @@ class LangGraphCIFixAgent(BaseAgent):
                 else SearchReplaceProposal.model_validate(result)
             )
             blocks = [b.model_dump() for b in proposal.blocks]
+            whole_files = [w.model_dump() for w in proposal.whole_files]
             root_cause = proposal.root_cause
             commit_message = proposal.commit_message
         except Exception:
@@ -1018,6 +1281,15 @@ class LangGraphCIFixAgent(BaseAgent):
                 for b in raw_blocks
                 if isinstance(b, dict)
             ]
+            raw_whole = payload.get("whole_files") or []
+            whole_files = [
+                {
+                    "file_path": str(w.get("file_path", "")),
+                    "updated_content": str(w.get("updated_content", "")),
+                }
+                for w in raw_whole
+                if isinstance(w, dict)
+            ]
             root_cause = str(payload.get("root_cause", state.get("root_cause") or "AI fix"))
             commit_message = str(
                 payload.get("commit_message", "fix: apply AI-generated patch")
@@ -1025,6 +1297,9 @@ class LangGraphCIFixAgent(BaseAgent):
 
         return {
             "blocks": [b for b in blocks if str(b.get("file_path") or "").strip()],
+            "whole_files": [
+                w for w in whole_files if str(w.get("file_path") or "").strip()
+            ],
             "root_cause": root_cause,
             "commit_message": commit_message,
         }
@@ -1162,6 +1437,11 @@ class LangGraphCIFixAgent(BaseAgent):
             pipeline_id=state["pipeline_id"],
             file_patches=patches,
             logs=state.get("logs") or "",
+            original_contents=baseline,
+            strategy_type=str(
+                (state.get("architecture_plan") or {}).get("strategy_type") or ""
+            ),
+            error_signature=signature,
         )
         output = f"$ {result.command}\n{result.output}"
         passed = result.passed
@@ -1347,6 +1627,8 @@ class LangGraphCIFixAgent(BaseAgent):
             "error_signature": {},
             "architecture_plan": empty_architecture_plan(),
             "expanded_files": [],
+            "repo_map": "",
+            "map_files": [],
             "task_breakdown": [],
             "file_contents": {},
             "search_replace_blocks": [],
@@ -1378,11 +1660,14 @@ class LangGraphCIFixAgent(BaseAgent):
             "search-replace",
             "patch-engine",
             "error-expansion",
+            "repo-map",
+            "hybrid-emit",
             "log-digest",
             "workspace_setup",
             "requirements_analysis",
             "technical_architecture",
             "error_expansion",
+            "repo_map",
             "task_breakdown",
             "code_implementation",
             "testing_validation",

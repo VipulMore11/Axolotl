@@ -10,7 +10,10 @@ subsystems that keep patches from failing on hallucinated formatting:
   B. Relative indentation preservation — the matched file lines' leading
      whitespace is captured and the replace block is re-indented relative to
      it, so mixed tabs / 2-space / 4-space hallucinations don't leak in.
-  C. Rich diagnostic feedback — on failure, difflib finds the closest real
+  C. Safe delta transfer — approximate matches receive only the intended
+     SEARCH→REPLACE delta; unrelated current-source divergence is preserved,
+     while overlapping drift and partial application are rejected atomically.
+  D. Rich diagnostic feedback — on failure, difflib finds the closest real
      lines so the LLM can be asked to fix ONLY the failed block while already
      applied blocks stay cached.
 """
@@ -19,8 +22,11 @@ from __future__ import annotations
 
 import difflib
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
+
+from diff_match_patch import diff_match_patch
 
 # Similarity (1 - normalized Levenshtein distance) required to accept a fuzzy match.
 DEFAULT_FUZZY_THRESHOLD = 0.85
@@ -120,6 +126,39 @@ def _middle_out_order(candidate_count: int, epicenter: int) -> list[int]:
     return sorted(range(candidate_count), key=lambda start: (abs(start - epicenter), start))
 
 
+def _relative_indent_signature(lines: list[str]) -> tuple[tuple[str, str], ...]:
+    """
+    Represent indentation as transitions between adjacent nonblank lines.
+
+    Absolute indentation on the first line is intentionally ignored. This is
+    the production-sized part of Aider's RelativeIndenter idea: blocks nested
+    at different levels still compare exactly when their relative structure
+    and code are identical.
+    """
+    signature: list[tuple[str, str]] = []
+    previous = ""
+    initialized = False
+    for line in lines:
+        body = line.lstrip()
+        indent = line[: len(line) - len(body)]
+        if not body.strip():
+            signature.append(("", ""))
+            continue
+        if not initialized:
+            transition = ""
+            initialized = True
+        elif indent.startswith(previous):
+            transition = "+" + indent[len(previous) :]
+        elif previous.startswith(indent):
+            transition = "-" * (len(previous) - len(indent))
+        else:
+            # Non-nesting whitespace switch (usually tabs vs spaces).
+            transition = "=" + indent
+        signature.append((transition, body.rstrip()))
+        previous = indent
+    return tuple(signature)
+
+
 # ── Indentation preservation (subsystem B) ──────────────────────────
 
 
@@ -217,6 +256,7 @@ class PatchResult:
     nearest_match: str = ""
     match_line: int = -1  # 1-based first line of the matched window
     similarity: float = 0.0
+    strategy: str = ""
 
 
 def _window_text(lines: list[str], start: int, size: int) -> str:
@@ -228,10 +268,12 @@ def _find_block(
     search_lines: list[str],
     line_hint: Optional[int],
     threshold: float,
-) -> tuple[int, float]:
+) -> tuple[int, float, str]:
     """
-    Locate `search_lines` in `file_lines` and return (start_index, similarity),
-    or (-1, best_similarity) when nothing clears the threshold.
+    Locate `search_lines` and return (start_index, similarity, strategy).
+
+    Exact/normalized duplicate matches without a line hint are rejected as
+    ambiguous rather than silently editing an arbitrary occurrence.
 
     Middle-out: candidates are tried by distance from the hint line so the
     correct region of large files is reached first; ties (e.g. duplicated
@@ -240,25 +282,53 @@ def _find_block(
     size = len(search_lines)
     candidate_count = len(file_lines) - size + 1
     if candidate_count <= 0:
-        return -1, 0.0
+        return -1, 0.0, "not_found"
 
     epicenter = (line_hint - 1) if line_hint else candidate_count // 2
     order = _middle_out_order(candidate_count, epicenter)
     search_text = "\n".join(search_lines)
 
+    def choose(starts: list[int], strategy: str) -> tuple[int, float, str]:
+        if not starts:
+            return -1, 0.0, strategy
+        if len(starts) > 1 and line_hint is None:
+            return -1, 1.0, f"ambiguous_{strategy}"
+        return min(starts, key=order.index), 1.0, strategy
+
     # Pass 1: exact match.
-    for start in order:
-        if _window_text(file_lines, start, size) == search_text:
-            return start, 1.0
+    exact = [
+        start
+        for start in order
+        if _window_text(file_lines, start, size) == search_text
+    ]
+    if exact:
+        return choose(exact, "exact")
 
     # Pass 2: trailing-whitespace-insensitive match.
     stripped_search = [line.rstrip() for line in search_lines]
-    for start in order:
-        if [l.rstrip() for l in file_lines[start : start + size]] == stripped_search:
-            return start, 1.0
+    whitespace = [
+        start
+        for start in order
+        if [line.rstrip() for line in file_lines[start : start + size]]
+        == stripped_search
+    ]
+    if whitespace:
+        return choose(whitespace, "whitespace")
 
-    # Pass 3: Levenshtein fuzzy scan, cheap difflib prefilter first.
+    # Pass 3: exact code/relative-indentation structure.
+    relative_search = _relative_indent_signature(search_lines)
+    relative = [
+        start
+        for start in order
+        if _relative_indent_signature(file_lines[start : start + size])
+        == relative_search
+    ]
+    if relative:
+        return choose(relative, "relative_indent")
+
+    # Pass 4: Levenshtein candidate discovery, cheap prefilter first.
     best_start, best_score = -1, 0.0
+    accepted: list[tuple[int, float]] = []
     prefilter_floor = max(0.0, threshold - 0.15)
     for start in order:
         window = _window_text(file_lines, start, size)
@@ -266,14 +336,128 @@ def _find_block(
         if quick.real_quick_ratio() < prefilter_floor or quick.quick_ratio() < prefilter_floor:
             continue
         score = levenshtein_similarity(window, search_text)
+        if score >= threshold:
+            accepted.append((start, score))
         if score > best_score:
             best_start, best_score = start, score
-            if score >= _EARLY_EXIT_SIMILARITY:
+            if line_hint is not None and score >= _EARLY_EXIT_SIMILARITY:
                 break
 
     if best_score >= threshold:
-        return best_start, best_score
-    return -1, best_score
+        if line_hint is None:
+            near_best = [
+                start
+                for start, score in accepted
+                if best_score - score <= 0.01
+            ]
+            if len(near_best) > 1:
+                return -1, best_score, "ambiguous_fuzzy"
+        return best_start, best_score, "fuzzy_delta"
+    return -1, best_score, "not_found"
+
+
+def _protected_divergent_lines(
+    search_lines: list[str],
+    replace_lines: list[str],
+    matched_lines: list[str],
+) -> Counter[str]:
+    """
+    Capture current-source lines outside the LLM's intended edit.
+
+    If SEARCH→REPLACE leaves a line unchanged but the real source has diverged
+    there, delta transfer must preserve the real line. This postcondition is
+    what prevents a fuzzy match from erasing concurrent/unrelated edits.
+    """
+    search_bodies = [line.rstrip() for line in search_lines]
+    replace_bodies = [line.rstrip() for line in replace_lines]
+    matcher = difflib.SequenceMatcher(
+        None, search_bodies, replace_bodies, autojunk=False
+    )
+    protected: Counter[str] = Counter()
+    for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+        if tag != "equal":
+            continue
+        for index in range(i1, min(i2, len(matched_lines))):
+            actual = matched_lines[index]
+            if actual.rstrip() != search_lines[index].rstrip():
+                protected[actual] += 1
+    return protected
+
+
+def _apply_fuzzy_delta(
+    matched_lines: list[str],
+    search_lines: list[str],
+    replace_lines: list[str],
+) -> tuple[Optional[list[str]], str]:
+    """
+    Transfer only the SEARCH→REPLACE delta onto the matched current source.
+
+    Unlike blind whole-window replacement, this preserves unrelated drift in
+    the current file. Every diff-match-patch hunk must apply, and unchanged
+    divergent lines are enforced as an atomic postcondition.
+    """
+    aligned_search = reindent_replace_block(
+        matched_lines, search_lines, search_lines
+    )
+    aligned_replace = reindent_replace_block(
+        matched_lines, search_lines, replace_lines
+    )
+    intent = difflib.SequenceMatcher(
+        None,
+        [line.rstrip() for line in aligned_search],
+        [line.rstrip() for line in aligned_replace],
+        autojunk=False,
+    )
+    for tag, i1, i2, _j1, _j2 in intent.get_opcodes():
+        if tag == "equal":
+            continue
+        # Inserts do not consume current-source lines and cannot overlap drift.
+        if i1 == i2:
+            continue
+        expected = [line.rstrip() for line in aligned_search[i1:i2]]
+        actual = [line.rstrip() for line in matched_lines[i1:i2]]
+        if expected != actual:
+            return None, (
+                "The current source diverged inside the lines this patch would "
+                "modify; refusing an unsafe fuzzy overwrite. Regenerate SEARCH "
+                "from the latest file contents."
+            )
+
+    search_text = "\n".join(aligned_search)
+    replace_text = "\n".join(aligned_replace)
+    matched_text = "\n".join(matched_lines)
+
+    dmp = diff_match_patch()
+    dmp.Diff_Timeout = 2
+    dmp.Match_Threshold = 0.35
+    dmp.Match_Distance = max(100, len(matched_text))
+    diff = dmp.diff_main(search_text, replace_text, None)
+    dmp.diff_cleanupSemantic(diff)
+    patches = dmp.patch_make(search_text, diff)
+    transferred, applied = dmp.patch_apply(patches, matched_text)
+    if not all(applied):
+        return None, "Aider-style delta transfer could not apply every edit atomically."
+
+    transferred_lines = transferred.splitlines()
+    protected = _protected_divergent_lines(
+        aligned_search, aligned_replace, matched_lines
+    )
+    remaining = Counter(transferred_lines)
+    lost = protected - remaining
+    if lost:
+        examples = ", ".join(repr(line) for line in list(lost)[:3])
+        return None, (
+            "Delta transfer would overwrite unrelated current-source changes "
+            f"({examples}); regenerate SEARCH from the latest file contents."
+        )
+    return transferred_lines, ""
+
+
+def _newline_style(text: str) -> str:
+    """Preserve the file's dominant line-ending convention."""
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    return "\r\n" if crlf > lf else "\n"
 
 
 def apply_fuzzy_patch(
@@ -310,29 +494,61 @@ def apply_fuzzy_patch(
     if not search_lines:
         return PatchResult(success=False, error="SEARCH block contains only blank lines.")
 
-    start, score = _find_block(file_lines, search_lines, line_hint, threshold)
+    start, score, strategy = _find_block(
+        file_lines, search_lines, line_hint, threshold
+    )
     if start < 0:
+        if strategy.startswith("ambiguous_"):
+            error = (
+                "SEARCH block matches multiple locations and no CI line hint "
+                "disambiguates them. Include more unique surrounding context."
+            )
+        else:
+            error = (
+                f"SEARCH block failed to match (best similarity {score:.2f} "
+                f"< {threshold:.2f})."
+            )
         return PatchResult(
             success=False,
-            error=f"SEARCH block failed to match (best similarity {score:.2f} < {threshold:.2f}).",
+            error=error,
             nearest_match=find_nearest_match(original, "\n".join(search_lines)),
             similarity=score,
+            strategy=strategy,
         )
 
     matched_lines = file_lines[start : start + len(search_lines)]
-    replace_lines = reindent_replace_block(
-        matched_lines, search_lines, replace_block.splitlines()
-    )
+    raw_replace_lines = replace_block.splitlines()
+    if strategy == "fuzzy_delta":
+        replace_lines, delta_error = _apply_fuzzy_delta(
+            matched_lines, search_lines, raw_replace_lines
+        )
+        if replace_lines is None:
+            return PatchResult(
+                success=False,
+                error=delta_error,
+                nearest_match=find_nearest_match(
+                    original, "\n".join(search_lines)
+                ),
+                match_line=start + 1,
+                similarity=score,
+                strategy=strategy,
+            )
+    else:
+        replace_lines = reindent_replace_block(
+            matched_lines, search_lines, raw_replace_lines
+        )
     updated_lines = file_lines[:start] + replace_lines + file_lines[start + len(search_lines):]
 
-    updated = "\n".join(updated_lines)
-    if original.endswith("\n") and not updated.endswith("\n"):
-        updated += "\n"
+    newline = _newline_style(original)
+    updated = newline.join(updated_lines)
+    if original.endswith(("\n", "\r")) and not updated.endswith(newline):
+        updated += newline
     return PatchResult(
         success=True,
         content=updated,
         match_line=start + 1,
         similarity=score,
+        strategy=strategy,
     )
 
 

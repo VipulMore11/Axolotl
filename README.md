@@ -288,6 +288,8 @@ CI_FIX_MAX_ATTEMPTS=3
 # CI_FIX_BLOCK_RETRIES=2        # targeted retries per failed SEARCH block
 # CI_FIX_FUZZY_THRESHOLD=0.85   # min Levenshtein similarity for a fuzzy match
 # CI_FIX_EXPANSION_MAX_FILES=25 # max files after same-error fan-out
+# CI_FIX_MAP_MAX_FILES=12       # max neighbor files in seeded repo map
+# CI_FIX_MAP_TOKEN_BUDGET=1800  # approx token budget for repo_map prompt text
 
 # ── CI log digest (LLM-facing; raw logs kept for regex tools) ─
 # CI_FIX_LOG_DIGEST_CHARS=3500  # max chars sent to LLM personas
@@ -431,7 +433,7 @@ Stage 5 no longer regenerates whole files. The Developer Agent (Gemini Pro) fetc
 - **Relative indentation preservation** — the search block and the matched file lines describe the same code in two styles, giving a per-level whitespace mapping. Replace lines are rewritten through it, so an LLM that hallucinates 2-space indents into a tabs file cannot corrupt formatting.
 - **Rich diagnostic partial retries** — when a block fails to match, `difflib` finds the closest real lines and the agent asks the LLM to fix **only that block** ("N of M blocks applied successfully. Do not resend them."), keeping applied blocks cached. Unresolved failures surface to the Evaluator and the revision loop.
 
-Empty `search_block` creates a new file. Downstream stages are unchanged: applied blocks become full-content `file_patches` for Docker validation, code review, and the per-file MCP commits.
+Empty `search_block` creates a new file. The Developer may also emit `whole_files` (complete file bodies) for new files, files ≤ ~120 lines, or paths where SEARCH/REPLACE previously failed — mixed with S/R in one proposal. Downstream stages are unchanged: applied edits become full-content `file_patches` for Docker validation, code review, and the per-file MCP commits.
 
 ### Same-error fan-out (`error_expansion`)
 
@@ -444,6 +446,17 @@ CI webhooks / job logs are often **fail-fast**: only the first broken file appea
 5. Stage 6 re-checks that actionable signature patterns no longer remain in expanded files; leftovers force another implementation loop.
 
 Pure dependency fixes still prioritize `requirements.txt`, and legitimate `import <missing_module>` usages are not treated as leftover failures.
+
+### Seeded repo map (`repo_map`)
+
+After fan-out, `repo_map` builds a **partial** symbol map from MCP-fetched Python files (no full clone):
+
+1. Seeds from expanded/seed files + identifier tokens in the digest/root cause.
+2. Extracts defs/refs with tree-sitter (`agents/queries/python-tags.scm`).
+3. Ranks neighbor files with NetworkX PageRank (Aider-style), fetching top neighbors via MCP up to `CI_FIX_MAP_MAX_FILES`.
+4. Injects a compact map into Tech Lead / Developer prompts and merges high-confidence symbol neighbors into `expanded_files`.
+
+If tree-sitter is unavailable, the stage degrades to an empty map and the pipeline continues.
 
 ### Knowledge Base (Neo4j)
 
@@ -756,6 +769,8 @@ axolotl/
 │   │   ├── knowledge_extraction.py   # Post-HITL KB write
 │   │   ├── patch_utils.py            # Search/Replace engine: middle-out fuzzy match, reindent, diagnostics
 │   │   ├── error_signature.py        # CI seed → searchable signature + fan-out merge helpers
+│   │   ├── repo_map.py               # Seeded tree-sitter + PageRank symbol map (MCP-backed)
+│   │   ├── queries/python-tags.scm   # Python def/ref queries for repo_map
 │   │   ├── log_reducer.py            # Deterministic CI log digest for LLM prompts
 │   │   ├── langsmith_tracing.py      # LangSmith env + run config helpers
 │   │   ├── sandbox_tools.py          # Ephemeral Docker validation helpers

@@ -72,6 +72,8 @@ class CIFixState(TypedDict):
     error_signature: ErrorSignatureState
     architecture_plan: ArchitecturePlan
     expanded_files: list[str]  # seed + repo fan-out siblings
+    repo_map: str  # compact symbol map for LLM context
+    map_files: list[str]  # ranked neighbor files included in the map
     task_breakdown: list[str]
     file_contents: dict[str, str]  # original repo contents fetched for patching
     search_replace_blocks: list[SearchReplaceBlock]
