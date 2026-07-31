@@ -32,6 +32,12 @@ from agents.ci_fix_state import (
     empty_architecture_plan,
 )
 from agents.exceptions import CIFixAgentError
+from agents.context_pack import (
+    assign_roles,
+    emit_style_hints_for_pack,
+    refine_render_modes,
+    render_pack,
+)
 from agents.error_signature import (
     extract_error_signature,
     merge_affected_files,
@@ -124,14 +130,19 @@ class SearchReplaceProposal(BaseModel):
     whole_files: list[WholeFilePatchModel] = Field(
         default_factory=list,
         description=(
-            "Full-file replacements for new files, small files (<=120 lines), "
-            "or files where SEARCH/REPLACE previously failed to apply"
+            "Full-file replacements ONLY for brand-new files or files where "
+            "SEARCH/REPLACE previously failed to apply. Prefer SEARCH/REPLACE "
+            "for existing files. When used, copy unchanged lines EXACTLY — "
+            "no drive-by cleanup or refactoring."
         ),
     )
     commit_message: str = Field(description="Short conventional commit message")
 
 
-WHOLE_FILE_LINE_LIMIT = 120
+# Used only as a size gate for post-failure whole-file fallback, not for initial emit.
+WHOLE_FILE_FALLBACK_LINE_LIMIT = 120
+# Back-compat alias
+WHOLE_FILE_LINE_LIMIT = WHOLE_FILE_FALLBACK_LINE_LIMIT
 
 
 class CritiqueResultModel(BaseModel):
@@ -167,18 +178,25 @@ Hard rules:
 
 def _persona_architect() -> str:
     return """You are the Architect Agent for Axolotl CI repair.
-Design a low-blast-radius fix based on the diagnosed root cause.
+Design a minimal, low-blast-radius fix based on the diagnosed root cause.
 
 Process:
 1. Choose strategy_type from the evidence in the diagnosis and CI digest:
    deps | import | lint | format | code_patch | config | test
-2. List ALL affected_files that need modification (multi-file allowed).
+2. List ONLY files that must change to make the failing CI check pass.
+   Include same-error siblings when the logs/signature clearly imply them.
 3. Do NOT default to requirements.txt unless the diagnosis clearly says
    "missing package" or "ModuleNotFoundError".
 
+Hard rules — CI surgeon, not a refactor bot:
+- Propose the smallest change set that clears the failure.
+- Do NOT plan refactors, renames, style cleanups, docstring edits, or
+  "while we're here" improvements.
+- Do NOT add files to affected_files just because they could be improved.
+
 IMPORTANT: CI logs are often fail-fast and may only name ONE broken file. Still
-list every file you can infer from the logs/stack traces. A later error_expansion
-stage will search the repo for siblings with the same signature and enlarge this list.
+list every file that shares the SAME failing signature. A later error_expansion
+stage will search the repo for siblings and enlarge this list when needed.
 
 Return ArchitecturePlan fields only."""
 
@@ -189,19 +207,35 @@ Turn the ArchitecturePlan into an ordered, dependency-aware checklist (3-6 short
 Your checklist should reflect the actual strategy (deps, import, lint, config, test,
 code_patch, etc.) — do not assume a specific error family.
 If expanded_files lists siblings beyond the seed failure, include a step to fix ALL of them
-in the same change set. Do not write code. Return only task_breakdown as a list of strings."""
+in the same change set.
+Do NOT add refactor, cleanup, or style-improvement tasks.
+Do not write code. Return only task_breakdown as a list of strings."""
 
 
 def _persona_developer() -> str:
-    return """You are the Developer Agent for Axolotl CI repair — a precise code surgeon.
-You emit a hybrid patch proposal: SEARCH/REPLACE blocks and/or whole-file updates.
+    return """You are the Developer Agent for Axolotl CI repair — a precise CI surgeon.
+You fix ONLY what is required to make the failing CI check pass.
+You are NOT a refactoring assistant and NOT a style linter.
 
-When to use each emit style:
-- SEARCH/REPLACE (`blocks`): default for large files and small targeted edits.
+Hard rules — NEVER do drive-by edits:
+- Do NOT refactor, rename, reformat, reorder, or "improve" unrelated code.
+- Do NOT remove unused imports, dead code, or style issues unless THAT is the
+  diagnosed CI failure (e.g. strategy_type is lint/format and those lines failed).
+- Do NOT rewrite comments, docstrings, or typing for taste.
+- Do NOT touch lines that are not required for the failing check to pass.
+- Change only what the failing check requires.
+- Trust EVIDENCE over guessed context. Do not invent packages/symbols from
+  alias maps, comments, or unloaded AWARENESS paths.
+- Only edit files under EDIT TARGETS (unless a HARD RULE explicitly allows otherwise).
+
+Emit style:
+- SEARCH/REPLACE (`blocks`) is the DEFAULT for all existing files.
   search_block must be copied CHARACTER-FOR-CHARACTER from the provided file contents.
-- Whole-file (`whole_files`): use when the file is NEW, the current file is <= 120 lines,
-  or a previous pass failed to apply SEARCH/REPLACE for that file. Provide the COMPLETE
-  updated file contents — never elide with "...".
+- Whole-file (`whole_files`) ONLY when:
+  (a) the file is NEW (does not exist yet), OR
+  (b) a previous SEARCH/REPLACE apply failed for that file.
+  When using whole_files, copy every unchanged line EXACTLY from the current
+  contents — change only the minimal lines needed for the fix. Never elide with "...".
 
 Strict process rules:
 1. Prefer the smallest correct change that resolves the diagnosed root cause.
@@ -213,16 +247,16 @@ Strict process rules:
 7. A proposal may mix blocks and whole_files across different paths.
 
 Fix guidance (follow the diagnosed root cause — examples, not the only paths):
-- Fix the diagnosed root cause in every expanded file.
-- For missing packages: add the dependency to the appropriate manifest file.
-- For lint/format: patch only the offending lines.
+- Fix the diagnosed root cause in every EDIT TARGET that still has it.
+- For missing packages: add ONLY packages named in EVIDENCE / missing-package list
+  to the manifest — never packages that merely appear in IMPORT_TO_PACKAGE_MAP.
+- For lint/format: patch only the offending lines reported by CI.
 - For logic/config/test errors: correct the faulty code, config value, or assertion.
 
 When revising, PRESERVE successful work: emit edits only for what must still change,
 guided by validation_failures and review revision_instructions.
 If `validation_failures` reports NEW issues introduced by your last patch, fix those.
-Do NOT expand blast radius by cleaning unrelated pre-existing lint unless validation
-explicitly requires it for the failure class."""
+Do NOT expand blast radius by cleaning unrelated pre-existing lint or style debt."""
 
 
 def _persona_evaluator() -> str:
@@ -233,22 +267,27 @@ Approval criteria (ALL must be true):
 1. The patch correctly addresses the diagnosed root cause.
 2. The patch matches the architecture plan's strategy and affected files.
 3. The patch does not introduce NEW bugs, syntax errors, or regressions.
-4. The patch is minimal — it changes only what is necessary to fix the CI failure.
+4. The patch is STRICTLY minimal — it changes only what is necessary to fix the CI failure.
 
-You MUST IGNORE:
-- Pre-existing unused imports, PEP8 issues, or code style problems that were
-  already present in the ORIGINAL file BEFORE the developer's patch.
-  (However, if the developer FIXED these pre-existing issues to satisfy the linter,
-  do NOT reject the patch for being non-minimal. Accept the cleanup).
-- Functions, classes, or logic that the developer did NOT touch.
-- Any issue visible in the original file diff context marked as ORIGINAL.
+You MUST REJECT (satisfactory=false) when the DIFF includes drive-by work such as:
+- Refactors, renames, reformatting, or reordering unrelated to the root cause
+- Removing unused imports / dead code that were NOT the CI failure
+- Comment/docstring/typing polish not required by the failing check
+- Any change that is not needed for the failing CI check to pass
+
+You MUST IGNORE (do not reject for these alone):
+- Pre-existing unused imports, PEP8 issues, or style problems that remain
+  unchanged in the ORIGINAL and were NOT introduced or "cleaned" by the patch
+- Functions, classes, or logic that the developer did NOT touch
+- Any issue visible in ORIGINAL context that the DIFF did not modify
 
 A DIFF section is provided showing exactly what lines were added/removed.
-Only evaluate those changes. If the diff correctly fixes the root cause
-without introducing new problems, mark satisfactory=true.
+Only evaluate those changes. Approve ONLY if the diff fixes the root cause,
+introduces no new bugs, AND contains no unnecessary improvements.
 
-If rejecting: issues MUST cite file paths and line numbers of NEWLY
-introduced problems, and revision_instructions must be concrete actionable edits.
+If rejecting: issues MUST cite file paths and line numbers of unnecessary or
+newly introduced problems, and revision_instructions must tell the developer
+to revert drive-by edits and keep only the minimal CI fix.
 Return CritiqueResult fields only."""
 
 
@@ -926,7 +965,7 @@ class LangGraphCIFixAgent(BaseAgent):
         if content is None:
             return (
                 f"### {path} (NEW FILE — does not exist yet; "
-                "prefer whole_files with the complete contents, or an empty search_block)"
+                "use whole_files with the complete contents, or an empty search_block)"
             )
         if len(content) <= self._FILE_CONTEXT_CHAR_CAP:
             return f"### {path}\n{content}"
@@ -982,73 +1021,100 @@ class LangGraphCIFixAgent(BaseAgent):
                     if path_name not in validation_files:
                         validation_files.append(path_name)
 
-        explicit_files = list(
-            dict.fromkeys(
-                [normalize_patch_path(p["file_path"]) for p in existing]
-                + expanded
-                + [normalize_patch_path(f) for f in (plan.get("affected_files") or [])]
-                + [normalize_patch_path(p) for p in (state.get("map_files") or [])]
-            )
+        existing_paths = [
+            normalize_patch_path(p["file_path"]) for p in existing if p.get("file_path")
+        ]
+        signature = dict(state.get("error_signature") or {})
+        missing_pkgs = list(signature.get("missing_packages") or [])
+        if not missing_pkgs and signature.get("module_name"):
+            missing_pkgs = [str(signature["module_name"]).split(".", 1)[0]]
+        pack = assign_roles(
+            strategy_type=str(plan.get("strategy_type") or ""),
+            error_class=str(signature.get("error_class") or ""),
+            seed_files=list(signature.get("seed_files") or []),
+            expanded_files=expanded,
+            plan_files=[normalize_patch_path(f) for f in (plan.get("affected_files") or [])],
+            map_files=[normalize_patch_path(p) for p in (state.get("map_files") or [])],
+            validation_files=validation_files,
+            existing_patch_files=existing_paths,
+            line_hints=hints,
+            missing_packages=missing_pkgs,
         )
-        target_files = list(dict.fromkeys(explicit_files + validation_files))
 
-        for file_path in target_files:
+        # Fetch bodies only for paths we will render (edit + evidence slices).
+        for file_path in pack.body_paths:
             if file_path not in baseline:
                 baseline[file_path] = await self._fetch_original(file_path)
 
-        target_files = [
-            p for p in target_files if baseline.get(p) is not None or p in explicit_files
-        ]
+        refine_render_modes(pack, baseline)
 
         patched_now = {
             normalize_patch_path(p["file_path"]): p["updated_content"] for p in existing
         }
         working: dict[str, str] = {}
-        for file_path in target_files:
+        for file_path in pack.edit_paths:
             if is_revision and file_path in patched_now:
                 working[file_path] = patched_now[file_path]
             else:
                 working[file_path] = baseline.get(file_path) or ""
 
-        emit_hints = self._emit_style_hints(
-            working, list(state.get("patch_failures") or [])
+        # Contents shown in the prompt: revision shows patched text for edits.
+        shown: dict[str, Optional[str]] = {}
+        for file_path in pack.body_paths:
+            if is_revision and file_path in patched_now and file_path in pack.edit_paths:
+                shown[file_path] = patched_now[file_path]
+            else:
+                shown[file_path] = baseline.get(file_path)
+
+        emit_hints = emit_style_hints_for_pack(
+            pack,
+            working,
+            list(state.get("patch_failures") or []),
+            self._prefer_whole_file,
         )
-        sections = []
-        for file_path in target_files:
-            shown = (
-                working[file_path]
-                if (is_revision and file_path in patched_now)
-                else baseline.get(file_path)
-            )
-            sections.append(
-                self._file_context_section(
-                    file_path, shown, line_hint_for(hints, file_path)
-                )
-            )
-        files_context = "\n\n".join(sections) or "(no file contents available)"
-        repo_map_text = str(state.get("repo_map") or "(none)")
+        context_block = render_pack(
+            pack,
+            shown,
+            repo_map=str(state.get("repo_map") or ""),
+            digest=logs_for_llm(state) if not is_revision else "",
+        )
+
+        await self._emit(
+            "code_implementation",
+            (
+                f"Context pack [{pack.strategy}]: "
+                f"{len(pack.edit_paths)} edit / "
+                f"{len(pack.awareness_paths)} awareness / "
+                f"{len(pack.reference_paths)} reference"
+            ),
+            {
+                "strategy": pack.strategy,
+                "edit_paths": pack.edit_paths[:20],
+                "awareness_paths": pack.awareness_paths[:20],
+                "reference_paths": pack.reference_paths[:10],
+                "missing_packages": pack.missing_packages[:20],
+            },
+        )
 
         tasks = state.get("task_breakdown") or []
-        signature = state.get("error_signature") or {}
         if is_revision:
             last_critique = history[-1] if history else None
             human = (
                 "TARGETED REVISION — emit hybrid edits ONLY for what must still change.\n"
+                "Change only what the failing CI check requires. No drive-by refactors, "
+                "renames, style cleanup, or unused-import removal unless that IS the failure.\n"
                 f"Root cause: {state.get('root_cause')}\n"
                 f"ArchitecturePlan: {json.dumps(plan)}\n"
                 f"Expanded files: {json.dumps(expanded)}\n"
                 f"Error signature: {json.dumps(signature)}\n"
                 f"Tasks: {json.dumps(tasks)}\n"
                 f"Emit style hints: {json.dumps(emit_hints)}\n"
-                f"Repo map:\n{repo_map_text}\n"
                 f"validation_failures: {json.dumps(failures[-3:])}\n"
                 f"patch apply failures: {json.dumps(list(state.get('patch_failures') or [])[-3:])}\n"
                 f"latest critique: {json.dumps(last_critique)}\n\n"
-                "CURRENT FILE CONTENTS (your prior patches are already applied — "
-                "search blocks must match THIS text exactly):\n"
-                f"{files_context}\n\n"
+                f"{context_block}\n\n"
                 "Return SearchReplaceProposal JSON: blocks and/or whole_files + commit_message. "
-                "Cover every expanded sibling that still has the error."
+                "Prefer SEARCH/REPLACE. Cover every EDIT TARGET that still has the error."
             )
         else:
             soft_hint = self._soft_error_hint(signature)
@@ -1059,17 +1125,16 @@ class LangGraphCIFixAgent(BaseAgent):
                 f"Root cause: {state.get('root_cause')}\n"
                 f"KB grounding:\n{state.get('kb_grounding') or '(none)'}\n"
                 f"ArchitecturePlan: {json.dumps(plan)}\n"
-                f"Expanded files (fix ALL of these if they share the error): {json.dumps(expanded)}\n"
+                f"Expanded files (worklist): {json.dumps(expanded)}\n"
                 f"Tasks: {json.dumps(tasks)}\n"
                 f"Emit style hints: {json.dumps(emit_hints)}\n"
                 f"Failure line hints: {json.dumps(hints) or '(none)'}\n"
-                f"Repo map:\n{repo_map_text}\n"
-                f"Relevant CI errors (digest):\n{logs_for_llm(state)}\n"
                 + (f"\n{soft_hint}\n" if soft_hint else "")
-                + "\nFILE CONTENTS (search blocks must match this text exactly):\n"
-                f"{files_context}\n\n"
+                + f"\n{context_block}\n\n"
+                "Change only what the failing CI check requires. No drive-by refactors, "
+                "renames, style cleanup, or unused-import removal unless that IS the failure.\n"
                 "Return SearchReplaceProposal JSON: blocks and/or whole_files + commit_message. "
-                "Emit edits for every expanded file that contains the error signature."
+                "Prefer SEARCH/REPLACE for existing EDIT TARGETS."
             )
 
         proposal = await self._invoke_search_replace(state, human)
@@ -1080,12 +1145,26 @@ class LangGraphCIFixAgent(BaseAgent):
             file_path = normalize_patch_path(str(item.get("file_path") or ""))
             if not file_path:
                 continue
+            if file_path not in working:
+                # Opportunistic: allow edits only if we can load the baseline
+                if file_path not in baseline:
+                    baseline[file_path] = await self._fetch_original(file_path)
+                working[file_path] = baseline.get(file_path) or ""
             working[file_path] = str(item.get("updated_content") or "")
             blocks = [
                 b
                 for b in blocks
                 if normalize_patch_path(str(b.get("file_path") or "")) != file_path
             ]
+
+        # Ensure working has baselines for any S/R paths not preloaded as edits
+        for block in blocks:
+            file_path = normalize_patch_path(str(block.get("file_path") or ""))
+            if not file_path or file_path in working:
+                continue
+            if file_path not in baseline:
+                baseline[file_path] = await self._fetch_original(file_path)
+            working[file_path] = baseline.get(file_path) or ""
 
         outcome = apply_blocks(blocks, working, hints, self.fuzzy_threshold)
 
@@ -1094,7 +1173,7 @@ class LangGraphCIFixAgent(BaseAgent):
             file_path = normalize_patch_path(str(failed_block.get("file_path") or ""))
             fixed = False
             current = outcome.contents.get(file_path, working.get(file_path, ""))
-            if self._prefer_whole_file(
+            if self._allow_whole_file_fallback(
                 current, file_path, list(state.get("patch_failures") or [])
             ):
                 whole = await self._invoke_whole_file_fix(
@@ -1195,11 +1274,24 @@ class LangGraphCIFixAgent(BaseAgent):
     def _prefer_whole_file(
         content: str, file_path: str, prior_failures: list[str]
     ) -> bool:
+        """Initial emit preference: whole-file only for new files or prior S/R failures."""
         if not content.strip():
             return True
         if any(file_path in failure for failure in prior_failures):
             return True
-        return content.count("\n") + 1 <= WHOLE_FILE_LINE_LIMIT
+        return False
+
+    @staticmethod
+    def _allow_whole_file_fallback(
+        content: str, file_path: str, prior_failures: list[str]
+    ) -> bool:
+        """
+        After a SEARCH/REPLACE apply failure, allow one whole-file retry for
+        new/prior-failed paths or reasonably small files (fallback size gate only).
+        """
+        if LangGraphCIFixAgent._prefer_whole_file(content, file_path, prior_failures):
+            return True
+        return content.count("\n") + 1 <= WHOLE_FILE_FALLBACK_LINE_LIMIT
 
     def _emit_style_hints(
         self, working: dict[str, str], prior_failures: list[str]
@@ -1219,11 +1311,15 @@ class LangGraphCIFixAgent(BaseAgent):
         error: str,
         state: CIFixState,
     ) -> Optional[str]:
-        """One-shot whole-file rewrite for small/failed SEARCH/REPLACE paths."""
+        """One-shot whole-file rewrite for new/failed SEARCH/REPLACE paths."""
         human = (
             f"SEARCH/REPLACE failed for `{file_path}`: {error}\n"
             "Return ONLY a WholeFilePatch JSON object with the COMPLETE updated file:\n"
             '{"file_path": "...", "updated_content": "..."}\n\n'
+            "CRITICAL: Copy every unchanged line EXACTLY from the current contents. "
+            "Change only the minimal lines needed for the CI fix. "
+            "Do NOT refactor, reformat, rename, or remove unused imports unless "
+            "that is the diagnosed root cause.\n"
             f"Root cause: {state.get('root_cause')}\n"
             f"Current file contents:\n{current}\n"
         )
@@ -1531,11 +1627,14 @@ class LangGraphCIFixAgent(BaseAgent):
             + "\n\n".join(numbered_blocks)
             + "\n\n"
             "IMPORTANT: Review ONLY the changes shown in the DIFF section above.\n"
-            "Do NOT reject for pre-existing issues (unused imports, PEP8 style, "
-            "unrelated functions) that appear in the ORIGINAL file and were NOT "
-            "introduced by the developer's patch.\n"
-            "Approve if the diff correctly fixes the root cause without introducing "
-            "new bugs. Return CritiqueResult."
+            "Approve ONLY if the diff fixes the root cause, introduces no new bugs, "
+            "AND is strictly minimal.\n"
+            "REJECT drive-by edits: refactors, renames, reformatting, unused-import "
+            "cleanup, comment/docstring polish, or any change not required for the "
+            "failing CI check.\n"
+            "Do NOT reject for pre-existing issues that remain unchanged in ORIGINAL "
+            "and were not introduced by the DIFF.\n"
+            "Return CritiqueResult."
         )
         structured = self.llm_pro.with_structured_output(CritiqueResultModel)
         try:

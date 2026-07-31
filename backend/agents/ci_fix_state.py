@@ -55,6 +55,7 @@ class ErrorSignatureState(TypedDict, total=False):
     seed_lines: dict[str, int]
     patterns: list[str]
     notes: str
+    missing_packages: list[str]
 
 
 class CIFixState(TypedDict):

@@ -78,6 +78,16 @@ _SUMMARY_RE = re.compile(
 _FILE_FRAME_RE = re.compile(r'^\s*File "[^"]+", line \d+')
 _JOB_HEADER_RE = re.compile(r"^---\s*Job:\s*.+")
 
+# Dependency-checker style listings (must survive digest compression).
+_MISSING_DEPS_HEADER_RE = re.compile(
+    r"(?i)(?:CI REQUIREMENT TEST FAILED|Missing dependencies in requirements|"
+    r"packages are imported in your code but missing|"
+    r"Please add them to requirements)"
+)
+_DEP_BULLET_RE = re.compile(
+    r"^\s*[•\*\-]\s*([A-Za-z0-9_.\-]+)\b(?:\s*\(imported in:([^)]*)\))?"
+)
+
 
 class ErrorBlock(TypedDict, total=False):
     kind: str  # traceback | pytest | lint | error_line | summary | tail
@@ -203,6 +213,58 @@ def _extract_pytest_blocks(lines: list[str]) -> list[ErrorBlock]:
     return blocks
 
 
+def _extract_deps_list_blocks(lines: list[str]) -> list[ErrorBlock]:
+    """
+    Keep dependency-checker bullet lists in the digest.
+
+    Without this, only the headline 'Missing dependencies…' survives and the
+    LLM invents packages from alias maps in checker source.
+    """
+    blocks: list[ErrorBlock] = []
+    i = 0
+    while i < len(lines):
+        if not _MISSING_DEPS_HEADER_RE.search(lines[i]):
+            i += 1
+            continue
+        chunk = [lines[i]]
+        i += 1
+        # Pull following explanatory + bullet lines
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if not stripped:
+                chunk.append(lines[i])
+                i += 1
+                if len(chunk) > 60:
+                    break
+                continue
+            if _DEP_BULLET_RE.match(stripped) or _MISSING_DEPS_HEADER_RE.search(stripped):
+                chunk.append(lines[i])
+                i += 1
+                continue
+            if re.search(r"(?i)please add them|the following packages", stripped):
+                chunk.append(lines[i])
+                i += 1
+                continue
+            # Stop at next unrelated error/summary
+            if (
+                _EXCEPTION_LINE_RE.match(stripped)
+                or _SUMMARY_RE.search(stripped)
+                or _TRACEBACK_START_RE.match(stripped)
+                or _PYTEST_FAILED_RE.match(stripped)
+            ):
+                break
+            # One soft trailing line (e.g. blank instruction) then stop
+            if len(chunk) <= 2 and len(stripped) < 200:
+                chunk.append(lines[i])
+                i += 1
+                continue
+            break
+        text = "\n".join(chunk).strip()
+        if text:
+            blocks.append({"kind": "deps_list", "text": text, "rank": 1})
+    return blocks
+
+
 def _extract_lint_and_error_lines(lines: list[str]) -> list[ErrorBlock]:
     blocks: list[ErrorBlock] = []
     seen: set[str] = set()
@@ -213,6 +275,9 @@ def _extract_lint_and_error_lines(lines: list[str]) -> list[ErrorBlock]:
         if _LINT_FINDING_RE.search(stripped):
             seen.add(stripped)
             blocks.append({"kind": "lint", "text": stripped, "rank": 2})
+        elif _DEP_BULLET_RE.match(stripped):
+            seen.add(stripped)
+            blocks.append({"kind": "deps_list", "text": stripped, "rank": 1})
         elif _EXCEPTION_LINE_RE.match(stripped) or (
             _ERROR_KEYWORD_RE.search(stripped) and not _WARNING_KEYWORD_RE.match(stripped)
             and len(stripped) < 400
@@ -315,6 +380,7 @@ def reduce_ci_logs(
     for _job_name, segment in _job_segments(filtered):
         blocks.extend(_extract_traceback_blocks(segment))
         blocks.extend(_extract_pytest_blocks(segment))
+        blocks.extend(_extract_deps_list_blocks(segment))
         blocks.extend(_extract_lint_and_error_lines(segment))
 
     tail = _tail_window(filtered, tail_lines)

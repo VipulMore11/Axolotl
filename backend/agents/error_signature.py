@@ -69,6 +69,13 @@ _BAD_IMPORT_LINE_RE = re.compile(
 _STACK_LINE_CONTENT_RE = re.compile(
     r'File "[^"]+", line \d+[^\n]*\n\s*(.+)'
 )
+_MISSING_DEP_BULLET_RE = re.compile(
+    r"[•\*\-]\s*([A-Za-z0-9_.\-]+)\s*\(imported in:\s*([^)]+)\)",
+    re.IGNORECASE,
+)
+_REQUIREMENT_FAIL_RE = re.compile(
+    r"(?i)(?:CI REQUIREMENT TEST FAILED|Missing dependencies in requirements)"
+)
 
 
 class ErrorSignature(TypedDict, total=False):
@@ -79,6 +86,7 @@ class ErrorSignature(TypedDict, total=False):
     seed_lines: dict[str, int]
     patterns: list[str]  # literal / light-regex strings for repo search
     notes: str
+    missing_packages: list[str]  # authoritative pkgs from checker output bullets
 
 
 def is_searchable_path(path: str) -> bool:
@@ -127,6 +135,23 @@ def extract_error_signature(
     module_name = ""
     error_class = "unknown"
     notes_parts: list[str] = []
+    missing_packages: list[str] = []
+
+    # Structured missing-deps bullets from project checkers (authoritative)
+    for match in _MISSING_DEP_BULLET_RE.finditer(combined):
+        pkg = match.group(1).strip()
+        if pkg and pkg.lower() not in {p.lower() for p in missing_packages}:
+            missing_packages.append(pkg)
+        for raw_path in re.split(r"\s*,\s*", match.group(2) or ""):
+            path = normalize_patch_path(raw_path.strip())
+            if path and path not in seed_files and is_searchable_path(path):
+                seed_files.append(path)
+    if missing_packages or _REQUIREMENT_FAIL_RE.search(combined):
+        error_class = "deps"
+        if missing_packages:
+            notes_parts.append(
+                "missing packages: " + ", ".join(missing_packages[:12])
+            )
 
     mod_match = _MODULE_NOT_FOUND_RE.search(combined)
     if mod_match:
@@ -200,6 +225,7 @@ def extract_error_signature(
         seed_lines={normalize_patch_path(k): int(v) for k, v in hints.items()},
         patterns=patterns,
         notes="; ".join(_unique(notes_parts)) or "generic CI failure seed",
+        missing_packages=missing_packages,
     )
 
 
